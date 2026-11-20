@@ -1,10 +1,11 @@
-//! ffd: keeps the ff index current.
+//! The Linux daemon: keeps the ff index current.
 //!
 //! Runs as root, scans the disk once, then listens to fanotify events for
 //! whole filesystems and patches the index as files come and go. The index
 //! is published to a file on a RAM-backed filesystem that the unprivileged
 //! `ff` and `ff-gui` read; they never talk to this process.
 
+#[path = "sys.rs"]
 mod sys;
 
 use std::collections::HashSet;
@@ -193,7 +194,7 @@ fn plan(mounts: Vec<Mount>, drives: &Drives, present: impl Fn(&str) -> bool) -> 
     plan
 }
 
-fn main() -> ExitCode {
+pub fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
