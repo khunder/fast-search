@@ -1,7 +1,6 @@
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, BufWriter, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -228,7 +227,7 @@ fn cmd_index(a: &Args, db: &PathBuf) -> Result<ExitCode, String> {
     let only_devices = !a.devices.is_empty() && a.free.len() == 1;
     let mut index = if only_devices { Index::new() } else { Index::build(&opts).map_err(|e| e.to_string())? };
     for device in &a.devices {
-        let name = std::os::unix::ffi::OsStrExt::as_bytes(device.as_os_str());
+        let name = ff_core::os::path_bytes(device);
         let read = ff_core::rawfs::scan(device, name).map_err(|e| format!("{}: {e}", device.display()))?;
         index.append(&read);
     }
@@ -295,7 +294,7 @@ fn cmd_search(a: &Args, db: &PathBuf) -> Result<ExitCode, String> {
         match_path: a.match_path,
         wildcards_anywhere: a.wildcards_anywhere,
     };
-    let query = Query::from_terms_opts(a.free.iter().map(|t| t.as_bytes()), &options);
+    let query = Query::from_terms_opts(a.free.iter().map(|t| ff_core::os::bytes(t)), &options);
     if let Some(problem) = query.error() {
         return Err(problem.to_string());
     }
