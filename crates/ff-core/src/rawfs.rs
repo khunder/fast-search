@@ -10,7 +10,6 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use crate::index::{FLAG_DIR, FLAG_SYMLINK, Index, NO_PARENT};
@@ -78,7 +77,7 @@ fn assemble(root_name: &[u8], root: u64, names: Vec<Found>, meta: &HashMap<u64, 
 pub fn scan(device: &Path, root_name: &[u8]) -> io::Result<Index> {
     let file = File::open(device)?;
     let mut head = [0u8; 2048];
-    file.read_exact_at(&mut head, 0)?;
+    crate::os::read_exact_at(&file, &mut head, 0)?;
     if &head[3..11] == b"NTFS    " {
         ntfs(&file, &head, root_name)
     } else if u16le(&head, 1024 + 56) == 0xEF53 {
@@ -102,7 +101,7 @@ struct Ext<'a> {
 impl Ext<'_> {
     fn block(&self, number: u64) -> io::Result<Vec<u8>> {
         let mut buf = vec![0u8; self.block_size as usize];
-        self.file.read_exact_at(&mut buf, number.checked_mul(self.block_size).ok_or_else(|| bad("block number overflow"))?)?;
+        crate::os::read_exact_at(&self.file, &mut buf, number.checked_mul(self.block_size).ok_or_else(|| bad("block number overflow"))?)?;
         Ok(buf)
     }
 
@@ -208,7 +207,7 @@ fn ext(file: &File, sb: &[u8], root_name: &[u8]) -> io::Result<Index> {
     }
     // The group descriptor table follows the superblock's block.
     let mut descriptors = vec![0u8; (groups * desc_size) as usize];
-    file.read_exact_at(&mut descriptors, (first_data_block + 1) * block_size)?;
+    crate::os::read_exact_at(&file, &mut descriptors, (first_data_block + 1) * block_size)?;
 
     let mut meta: HashMap<u64, Meta> = HashMap::new();
     let mut names: Vec<Found> = Vec::new();
@@ -223,7 +222,7 @@ fn ext(file: &File, sb: &[u8], root_name: &[u8]) -> io::Result<Index> {
         let unused = u16le(desc, 28).min(inodes_per_group);
         let used = (inodes_per_group - unused) as usize;
         let mut inodes = vec![0u8; used * inode_size as usize];
-        if file.read_exact_at(&mut inodes, table * block_size).is_err() {
+        if crate::os::read_exact_at(&file, &mut inodes, table * block_size).is_err() {
             continue;
         }
         for (i, inode) in inodes.chunks_exact(inode_size as usize).enumerate() {
@@ -370,7 +369,7 @@ fn ntfs(file: &File, boot: &[u8], root_name: &[u8]) -> io::Result<Index> {
     let mft_start = u64le(boot, 0x30) * cluster;
     let read_record = |offset: u64| -> Option<Vec<u8>> {
         let mut record = vec![0u8; record_size as usize];
-        file.read_exact_at(&mut record, offset).ok()?;
+        crate::os::read_exact_at(&file, &mut record, offset).ok()?;
         fixup(&mut record).then_some(record)
     };
 
@@ -389,7 +388,7 @@ fn ntfs(file: &File, boot: &[u8], root_name: &[u8]) -> io::Result<Index> {
                 let mut data = Vec::new();
                 for (start, len) in list_runs {
                     let mut chunk = vec![0u8; (len * cluster).min(1 << 24) as usize];
-                    file.read_exact_at(&mut chunk, start? * cluster).ok()?;
+                    crate::os::read_exact_at(&file, &mut chunk, start? * cluster).ok()?;
                     data.extend(chunk);
                 }
                 Some(data)
@@ -447,7 +446,7 @@ fn ntfs(file: &File, boot: &[u8], root_name: &[u8]) -> io::Result<Index> {
         while done < total {
             let count = chunk_records.min(total - done);
             let mut chunk = vec![0u8; (count * record_size) as usize];
-            if file.read_exact_at(&mut chunk, start * cluster + done * record_size).is_ok() {
+            if crate::os::read_exact_at(&file, &mut chunk, start * cluster + done * record_size).is_ok() {
                 for (i, record) in chunk.chunks_exact_mut(record_size as usize).enumerate() {
                     ntfs_record(number + i as u64, record, &mut meta, &mut names);
                 }
@@ -504,15 +503,19 @@ fn ntfs_record(number: u64, record: &mut [u8], meta: &mut HashMap<u64, Meta>, na
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::{Query, SearchOptions};
     use std::fs;
+    #[cfg(unix)]
     use std::process::Command;
 
+    #[cfg(unix)]
     fn tool(name: &str) -> Option<String> {
         ["/usr/sbin", "/sbin", "/usr/bin"].iter().map(|d| format!("{d}/{name}")).find(|p| Path::new(p).exists())
     }
 
     /// All paths in an index, relative to its root, sorted.
+    #[cfg(unix)]
     fn paths(index: &Index) -> Vec<String> {
         let mut all: Vec<String> = (1..index.len() as u32)
             .map(|id| index.path(id).to_string_lossy().trim_start_matches("/img/").to_string())
@@ -521,6 +524,7 @@ mod tests {
         all
     }
 
+    #[cfg(unix)]
     fn sample_tree(root: &Path) {
         fs::create_dir_all(root.join("docs/deep/deeper")).unwrap();
         fs::create_dir_all(root.join("empty")).unwrap();
@@ -535,6 +539,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn ext_roundtrip(fs_type: &str) {
         // Skipped quietly where the tool that makes test images is missing.
         let Some(mkfs) = tool("mkfs.ext4") else { return };
@@ -578,16 +583,19 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn reads_ext4() {
         ext_roundtrip("ext4");
     }
 
     #[test]
+    #[cfg(unix)]
     fn reads_ext2_block_maps() {
         ext_roundtrip("ext2");
     }
 
     #[test]
+    #[cfg(unix)]
     fn reads_ntfs() {
         let (Some(mkfs), Some(ntfscp)) = (tool("mkfs.ntfs"), tool("ntfscp")) else { return };
         let dir = std::env::temp_dir().join(format!("ff_rawfs_ntfs_{}", std::process::id()));

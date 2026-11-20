@@ -214,7 +214,17 @@ impl Term {
             CaseMode::Sensitive => false,
             CaseMode::Insensitive => true,
         };
-        let path = opts.match_path || raw.contains(&b'/');
+        // On Windows a term may separate folders with `/` or `\`; paths
+        // in the index use `\`, so `/` is read as `\`.
+        let path = opts.match_path || raw.contains(&b'/') || (cfg!(windows) && !opts.regex && raw.contains(&b'\\'));
+        let native: Vec<u8>;
+        let (raw, text) = if cfg!(windows) && raw.contains(&b'/') {
+            native = raw.iter().map(|&b| if b == b'/' { b'\\' } else { b }).collect();
+            // In a regex the backslash must itself be escaped.
+            (&native[..], if opts.regex { text.replace('/', r"\\").into() } else { text })
+        } else {
+            (raw, text)
+        };
         let pattern = if opts.regex {
             let regex = regex_lite::RegexBuilder::new(&text).case_insensitive(ci).build();
             Pattern::Regex(regex.map_err(|e| format!("bad regular expression \"{text}\": {e}"))?)
@@ -566,10 +576,11 @@ mod tests {
 
         let find = |q: &str, kind| {
             let o = SearchOptions { kind, sort: Sort::Path, ..Default::default() };
-            let root = fs::canonicalize(&root).unwrap();
+            let root = crate::os::canonicalize(&root).unwrap();
             ix.search(&Query::parse(q), &o)
                 .into_iter()
-                .map(|i| ix.path(i).strip_prefix(&root).unwrap().to_str().unwrap().to_owned())
+                // Written with `/` whatever the platform's separator.
+                .map(|i| ix.path(i).strip_prefix(&root).unwrap().to_str().unwrap().replace('\\', "/"))
                 .collect::<Vec<_>>()
         };
         assert_eq!(find("main", Kind::Any), ["src/Main.rs"]);
@@ -733,7 +744,6 @@ mod tests {
     fn hidden_names_can_be_left_out() {
         use crate::live::LiveIndex;
         use std::collections::HashSet;
-        use std::os::unix::ffi::OsStrExt;
         let root = std::env::temp_dir().join(format!("ff_hidden_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join(".config/app")).unwrap();
@@ -741,7 +751,7 @@ mod tests {
         fs::write(root.join(".config/app/settings.ini"), "").unwrap();
         fs::write(root.join(".profile"), "").unwrap();
         fs::write(root.join("docs/visible.txt"), "").unwrap();
-        let root = fs::canonicalize(&root).unwrap();
+        let root = crate::os::canonicalize(&root).unwrap();
         let count = |ix: &Index, q: &str| ix.search(&Query::parse(q), &SearchOptions::default()).len();
 
         let all = Index::build(&BuildOptions::new([&root])).unwrap();
@@ -764,7 +774,7 @@ mod tests {
         fs::write(root.join(".newhidden"), "").unwrap();
         fs::write(root.join(".config/app/more.ini"), "").unwrap();
         fs::write(root.join("docs/shown.txt"), "").unwrap();
-        let change = |dir: &std::path::Path, name: &str| (dir.as_os_str().as_bytes().to_vec(), name.as_bytes().to_vec());
+        let change = |dir: &std::path::Path, name: &str| (crate::os::path_bytes(dir).to_vec(), name.as_bytes().to_vec());
         let batch = HashSet::from([
             change(&root, ".newhidden"),
             change(&root.join(".config/app"), "more.ini"),
