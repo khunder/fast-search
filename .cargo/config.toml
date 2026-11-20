@@ -1,10 +1,23 @@
 # Fully static binaries (musl), linked with the linker that ships with Rust,
 # so no system C toolchain is needed.
+#
+# On Windows, name the Windows target instead (cargo has no per-host
+# default target), or use the aliases below:
+#   cargo win            # build --release for x86_64-pc-windows-msvc
+#   cargo win-gnu        # the same with the MinGW toolchain (no Visual Studio)
+#   cargo test --target x86_64-pc-windows-msvc
 [build]
 target = "x86_64-unknown-linux-musl"
 
 [target.x86_64-unknown-linux-musl]
 linker = "rust-lld"
+
+# The C runtime linked in, so the .exe files need nothing installed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]
 
 # `cargo dist`: the release build with the standard library itself rebuilt
 # for size and with panics reduced to an immediate abort (no messages).
@@ -19,3 +32,5 @@ dist = [
     "--config",
     "build.rustflags=['-Zunstable-options', '-Cpanic=immediate-abort']",
 ]
+win = ["build", "--release", "--target", "x86_64-pc-windows-msvc"]
+win-gnu = ["build", "--release", "--target", "x86_64-pc-windows-gnu"]

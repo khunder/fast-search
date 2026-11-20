@@ -4,7 +4,7 @@
 [![CI](https://github.com/khunder/fast-search/actions/workflows/ci.yml/badge.svg)](https://github.com/khunder/fast-search/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Instant file search for Linux.** Type part of a name and get every
+**Instant file search for Linux and Windows.** Type part of a name and get every
 matching file on the disk in milliseconds.
 
 ![Fast search window](docs/screenshot.png)
@@ -49,6 +49,7 @@ Packages for 64-bit Intel/AMD Linux are attached to every
 | Arch Linux | [`packaging/arch/PKGBUILD`](packaging/arch/PKGBUILD) | `cd packaging/arch && makepkg -si` |
 | Any distribution | [`fast-search-x86_64.AppImage`](https://github.com/khunder/fast-search/releases/latest/download/fast-search-x86_64.AppImage) | `chmod +x` it and run it |
 | Plain binaries | [`fast-search-x86_64.tar.gz`](https://github.com/khunder/fast-search/releases/latest/download/fast-search-x86_64.tar.gz) | unpack anywhere |
+| Windows 10/11 | [`fast-search-windows-x86_64.zip`](https://github.com/khunder/fast-search/releases/latest/download/fast-search-windows-x86_64.zip) | unzip anywhere; see [Windows](#windows) |
 
 Each contains `ff`, `ff-gui` and `ffd`. The AppImage starts the window;
 `./fast-search-x86_64.AppImage ff ...` runs the command. The packages are
@@ -431,6 +432,64 @@ they cannot open.** Only names, sizes and dates are exposed, never
 contents. Use a group that contains only the people who should have that
 view; without `--group`, only root can read the index.
 
+## Windows
+
+All three programs and the library run natively on 64-bit Windows 10 and
+later, with the same features and options as on Linux. A release attaches
+`fast-search-windows-x86_64.zip` with `ff.exe`, `ff-gui.exe` and `ffd.exe`.
+
+Build them with Rust installed through rustup (the pinned nightly is
+fetched on the first build). Cargo's default target is Linux musl, so name
+the Windows one:
+
+```sh
+cargo win                      # x86_64-pc-windows-msvc (Visual Studio Build Tools)
+cargo win-gnu                  # x86_64-pc-windows-gnu (no Visual Studio needed)
+cargo test --target x86_64-pc-windows-msvc
+```
+
+The `.exe` files land in `target/<target>/release/` and need nothing
+installed (the C runtime is linked in).
+
+What differs from Linux:
+
+- **Paths** are written the Windows way, `C:\Users\me\notes.txt`. In a
+  search term, `/` and `\` both separate folders: `src/main` and
+  `src\main` find the same files.
+- **What is indexed by default** is every fixed drive (`C:\`, `D:\`, ...),
+  skipping `System Volume Information`, `$Recycle.Bin`, `$WinREAgent` and
+  `Config.Msi`. `--no-hidden` also leaves out files with the hidden
+  attribute.
+- **Files are kept** in `%LOCALAPPDATA%\ff\index.db` (the index) and
+  `%APPDATA%\ff` (settings, bookmarks).
+- **Desktop actions** use the shell: open with the default application,
+  show in Explorer, the file type's *Edit* action (else Notepad), and
+  moving to the Recycle Bin.
+- **`ff -i`** runs in Windows Terminal or the classic console. Enter and
+  F4 open `%VISUAL%` or `%EDITOR%`, else Notepad. There is no `sudoedit`
+  and no Ctrl+Z suspend.
+- **The window** has a native title bar, follows the Windows dark mode
+  setting and uses fonts from `C:\Windows\Fonts`. Results can be dragged
+  to Explorer and copied as files. The global shortcut is a hotkey on a
+  Start-menu shortcut, so it needs Ctrl+Alt (default Ctrl+Alt+F).
+- **Live updates:** `ffd` watches each drive with `ReadDirectoryChangesW`
+  and publishes `C:\ProgramData\ff\index.db`, which `ff` and `ff-gui` then
+  use. Install it as a service from an administrator prompt (or from the
+  window's Options):
+
+  ```sh
+  ffd --install-service       # auto-starting service, runs as LocalSystem
+  ffd --configure --skip D:   # per-drive choices, in C:\ProgramData\ff\ffd.conf
+  ffd --uninstall-service
+  ```
+
+  `ffd C:\Users` runs it in the console instead. Changes made while it
+  is stopped are picked up by the full scan when it starts. Every user of
+  the machine can read the published index, so it shows the names of all
+  files, as the reader group does on Linux.
+- Reading unmounted ext4 or NTFS drives directly (`--device`) is Linux
+  only.
+
 ## Packaging and releases
 
 ```sh
@@ -488,7 +547,8 @@ and the checklist before a release are in
 
 ## Limitations
 
-- Linux only. The window runs natively on Wayland and on X11.
+- Linux and Windows (see [Windows](#windows)). On Linux the window runs
+  natively on Wayland and on X11.
 - On Wayland, typing accents with dead keys or Compose is not supported
   yet, and a compositor without title bars of its own (GNOME) always gets
   the built-in title bar.
