@@ -6,7 +6,7 @@ use std::io;
 use std::time::Duration;
 
 use crate::canvas::Canvas;
-pub use crate::x11::Key;
+pub use crate::keys::Key;
 
 /// One of our two windows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -67,7 +67,7 @@ pub enum Event {
 }
 
 pub trait Backend {
-    /// "X11" or "Wayland".
+    /// "X11", "Wayland" or "Win32".
     fn name(&self) -> &'static str;
 
     /// The desktop scale: 1.0 is 96 dpi.
@@ -134,6 +134,7 @@ pub struct WindowSpec<'a> {
 /// A Wayland session gets the Wayland backend, anything else X11;
 /// `FF_GUI_BACKEND=x11` or `=wayland` forces one. If the preferred one
 /// cannot be reached, the other is tried.
+#[cfg(not(windows))]
 pub fn connect(spec: &WindowSpec) -> io::Result<Box<dyn Backend>> {
     let forced = std::env::var("FF_GUI_BACKEND").ok();
     let wayland_session = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
@@ -148,4 +149,10 @@ pub fn connect(spec: &WindowSpec) -> io::Result<Box<dyn Backend>> {
         }),
         _ => x11(spec).or_else(|x11_error| wayland(spec).map_err(|_| x11_error)),
     }
+}
+
+/// On Windows there is one choice: the Win32 window manager.
+#[cfg(windows)]
+pub fn connect(spec: &WindowSpec) -> io::Result<Box<dyn Backend>> {
+    crate::win32::Win32::connect(spec).map(|b| Box::new(b) as Box<dyn Backend>)
 }

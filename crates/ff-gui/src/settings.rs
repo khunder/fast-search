@@ -4,7 +4,9 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::{Command, Stdio};
+#[cfg(not(windows))]
 use std::time::SystemTime;
 
 fn other(msg: impl Into<String>) -> io::Error {
@@ -12,6 +14,7 @@ fn other(msg: impl Into<String>) -> io::Error {
 }
 
 /// `$VAR`, else `~/fallback`.
+#[cfg(not(windows))]
 fn home_dir(var: &str, fallback: &str) -> io::Result<PathBuf> {
     if let Some(dir) = std::env::var_os(var).filter(|v| !v.is_empty()) {
         return Ok(dir.into());
@@ -23,6 +26,7 @@ fn home_dir(var: &str, fallback: &str) -> io::Result<PathBuf> {
 /// The program to start for "Fast search": the AppImage file when we run
 /// from one (the path inside it only exists while it runs), else this
 /// executable.
+#[cfg(not(windows))]
 fn launch_path() -> io::Result<PathBuf> {
     match std::env::var_os("APPIMAGE").filter(|v| !v.is_empty()) {
         Some(appimage) => Ok(appimage.into()),
@@ -38,6 +42,7 @@ fn launch_path() -> io::Result<PathBuf> {
 }
 
 /// True if the desktop asks applications for a dark appearance.
+#[cfg(not(windows))]
 pub fn desktop_prefers_dark() -> bool {
     let scheme = Command::new("gsettings").args(["get", "org.gnome.desktop.interface", "color-scheme"]).output();
     scheme.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("dark"))
@@ -61,7 +66,7 @@ pub struct Config {
 
 impl Config {
     fn path() -> io::Result<PathBuf> {
-        Ok(home_dir("XDG_CONFIG_HOME", ".config")?.join("ff/gui.conf"))
+        Ok(ff_core::os::config_dir().ok_or_else(|| other("HOME is not set"))?.join("ff").join("gui.conf"))
     }
 
     pub fn load() -> Config {
@@ -106,6 +111,7 @@ impl Config {
 
 // ---- applications menu entry ----------------------------------------------
 
+#[cfg(not(windows))]
 const ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
 <path d="M5 50A51 51 0 0 1 95 50A51 51 0 0 1 5 50Z" fill="#f08a1c"/>
 <path d="M11.34 50A45.5 45.5 0 0 1 88.66 50A45.5 45.5 0 0 1 11.34 50Z" fill="#fdfdfd"/>
@@ -116,18 +122,21 @@ const ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 
 "##;
 
 /// (desktop entry, icon file, icon theme folder).
+#[cfg(not(windows))]
 fn launcher_paths() -> io::Result<(PathBuf, PathBuf, PathBuf)> {
     let data = home_dir("XDG_DATA_HOME", ".local/share")?;
     let theme = data.join("icons/hicolor");
     Ok((data.join("applications/ff-gui.desktop"), theme.join("scalable/apps/ff-gui.svg"), theme))
 }
 
+#[cfg(not(windows))]
 pub fn launcher_installed() -> bool {
     launcher_paths().is_ok_and(|(entry, ..)| entry.exists())
 }
 
 /// A stale icon cache would hide a new icon: rebuild it if we can, and
 /// mark the theme folder as changed either way.
+#[cfg(not(windows))]
 fn refresh_icon_cache(theme: &Path) {
     let _ = Command::new("gtk-update-icon-cache").args(["-f", "-t", "-q"]).arg(theme).status();
     let _ = fs::File::open(theme).and_then(|dir| dir.set_modified(SystemTime::now()));
@@ -135,6 +144,7 @@ fn refresh_icon_cache(theme: &Path) {
 
 /// Writes a desktop entry and icon so the desktop lists "Fast search"
 /// with its icon in the applications menu and the dock.
+#[cfg(not(windows))]
 pub fn install_launcher() -> io::Result<PathBuf> {
     let (entry, icon, theme) = launcher_paths()?;
     for file in [&entry, &icon] {
@@ -152,6 +162,7 @@ pub fn install_launcher() -> io::Result<PathBuf> {
     Ok(entry)
 }
 
+#[cfg(not(windows))]
 pub fn remove_launcher() -> io::Result<()> {
     let (entry, icon, theme) = launcher_paths()?;
     for file in [entry, icon] {
@@ -166,9 +177,12 @@ pub fn remove_launcher() -> io::Result<()> {
 
 // ---- global shortcut (GNOME) ------------------------------------------------
 
+#[cfg(not(windows))]
 const KEYS_SCHEMA: &str = "org.gnome.settings-daemon.plugins.media-keys";
+#[cfg(not(windows))]
 const KEY_PATH: &str = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/ff/";
 /// The keys used until the user chooses others.
+#[cfg(not(windows))]
 pub const DEFAULT_SHORTCUT: &str = "Alt+E";
 
 /// Keys with a name: how we write them, and their GNOME (X keysym) name.
@@ -265,6 +279,7 @@ pub fn shortcut_label(binding: &str) -> String {
     out + &key
 }
 
+#[cfg(not(windows))]
 fn gsettings(args: &[&str]) -> io::Result<String> {
     let out = Command::new("gsettings").args(args).stdin(Stdio::null()).output().map_err(|e| match e.kind() {
         io::ErrorKind::NotFound => other("this needs GNOME's gsettings command"),
@@ -277,16 +292,19 @@ fn gsettings(args: &[&str]) -> io::Result<String> {
 }
 
 /// The desktop's list of custom shortcut paths, e.g. `['/a/', '/b/']`.
+#[cfg(not(windows))]
 fn custom_shortcuts() -> io::Result<Vec<String>> {
     let list = gsettings(&["get", KEYS_SCHEMA, "custom-keybindings"])?;
     Ok(list.split('\'').skip(1).step_by(2).map(String::from).collect())
 }
 
+#[cfg(not(windows))]
 pub fn shortcut_enabled() -> bool {
     custom_shortcuts().is_ok_and(|list| list.iter().any(|p| p == KEY_PATH))
 }
 
 /// The keys of the shortcut the desktop has for us now, if any.
+#[cfg(not(windows))]
 pub fn current_shortcut() -> Option<String> {
     let ours = format!("{KEYS_SCHEMA}.custom-keybinding:{KEY_PATH}");
     let binding = gsettings(&["get", &ours, "binding"]).ok()?;
@@ -297,6 +315,7 @@ pub fn current_shortcut() -> Option<String> {
 /// The command the desktop runs for the shortcut, as the text `gsettings`
 /// takes: this program's path, quoted so that the desktop reads it as
 /// one word whatever it contains.
+#[cfg(not(windows))]
 fn shortcut_command() -> io::Result<String> {
     let exe = launch_path()?;
     let exe = exe.to_str().ok_or_else(|| other("the program path is not valid UTF-8"))?;
@@ -307,6 +326,7 @@ fn shortcut_command() -> io::Result<String> {
 /// Versions before 0.10 could save the command as "path (deleted)" when
 /// the program had been replaced while it ran; the desktop then started
 /// it with "(deleted)" as the search text. Puts the right command back.
+#[cfg(not(windows))]
 pub fn repair_shortcut() {
     let ours = format!("{KEYS_SCHEMA}.custom-keybinding:{KEY_PATH}");
     let Ok(saved) = gsettings(&["get", &ours, "command"]) else { return };
@@ -319,6 +339,7 @@ pub fn repair_shortcut() {
 
 /// Adds the shortcut `keys` (as in "Ctrl+Alt+F") that starts this
 /// program, or removes ours. Returns the new state.
+#[cfg(not(windows))]
 pub fn set_shortcut(on: bool, keys: &str) -> io::Result<bool> {
     let binding = if on { shortcut_binding(keys).map_err(other)? } else { String::new() };
     let mut list = custom_shortcuts()?;
@@ -341,13 +362,16 @@ pub fn set_shortcut(on: bool, keys: &str) -> io::Result<bool> {
 
 // ---- live-updates service (ffd) ---------------------------------------------
 
+#[cfg(not(windows))]
 const INSTALLED_DAEMON: &str = "/usr/local/bin/ffd";
 
+#[cfg(not(windows))]
 pub fn daemon_installed() -> bool {
     Path::new("/etc/systemd/system/ffd.service").exists()
 }
 
 /// Name of this user's primary group, who will be allowed to read the index.
+#[cfg(not(windows))]
 fn primary_group() -> io::Result<String> {
     let status = fs::read_to_string("/proc/self/status")?;
     let gid = status
@@ -369,6 +393,7 @@ fn primary_group() -> io::Result<String> {
 /// Installs or removes the root service, asking for the password through
 /// the desktop's authorization dialog (pkexec). Blocks until answered;
 /// returns a message for the status bar.
+#[cfg(not(windows))]
 pub fn set_daemon(install: bool) -> String {
     let run = || -> io::Result<String> {
         // The ffd binary: next to this program, or already installed.
@@ -412,6 +437,7 @@ pub fn set_daemon(install: bool) -> String {
 
 // ---- drives -----------------------------------------------------------------
 
+#[cfg(not(windows))]
 const DAEMON_CONFIG: &str = "/etc/ffd.conf";
 
 /// A partition as shown on the Drives screen.
@@ -437,6 +463,7 @@ pub fn drives_automatic() -> bool {
 
 /// The partitions with a filesystem we know, with their current settings
 /// from the daemon's configuration.
+#[cfg(not(windows))]
 pub fn drives() -> Vec<Drive> {
     let listing = Command::new("lsblk").args(["-P", "-p", "-o", "NAME,FSTYPE,MOUNTPOINT,SIZE"]).output();
     let listing = listing.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
@@ -505,6 +532,7 @@ pub fn configure_args(settings: &[(String, bool, bool, bool)], automatic: bool, 
     args
 }
 
+#[cfg(not(windows))]
 pub fn apply_drives(
     settings: Vec<(String, bool, bool, bool)>,
     automatic: bool,
@@ -524,6 +552,190 @@ pub fn apply_drives(
             Some(0) => Ok("Index settings saved; the index is being rebuilt".into()),
             Some(126 | 127) => Err(other("not authorized")),
             _ => Err(other(String::from_utf8_lossy(&out.stderr).trim().lines().last().unwrap_or("failed").to_string())),
+        }
+    };
+    run().unwrap_or_else(|e| format!("Index settings not changed: {e}"))
+}
+
+// ---- Windows: Start menu entry, hot key, live-updates service, drives --------
+
+#[cfg(windows)]
+use crate::winsys;
+
+#[cfg(windows)]
+fn launch_path() -> io::Result<PathBuf> {
+    std::env::current_exe()
+}
+
+/// True if Windows is set to dark mode for applications.
+#[cfg(windows)]
+pub fn desktop_prefers_dark() -> bool {
+    let key = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+    winsys::reg_dword(winsys::HKEY_CURRENT_USER, key, "AppsUseLightTheme") == Some(0)
+}
+
+/// The Start menu shortcut, which also carries the global hot key.
+#[cfg(windows)]
+fn start_menu_link() -> io::Result<PathBuf> {
+    let appdata = ff_core::os::config_dir().ok_or_else(|| other("APPDATA is not set"))?;
+    Ok(appdata.join(r"Microsoft\Windows\Start Menu\Programs\Fast search.lnk"))
+}
+
+/// Where the chosen hot key is remembered (a .lnk is not easily read back).
+#[cfg(windows)]
+fn shortcut_state() -> io::Result<PathBuf> {
+    Ok(ff_core::os::config_dir().ok_or_else(|| other("APPDATA is not set"))?.join("ff").join("shortcut.txt"))
+}
+
+#[cfg(windows)]
+pub fn launcher_installed() -> bool {
+    start_menu_link().is_ok_and(|l| l.exists())
+}
+
+/// Adds "Fast search" to the Start menu (keeping the hot key, if any).
+#[cfg(windows)]
+pub fn install_launcher() -> io::Result<PathBuf> {
+    let link = start_menu_link()?;
+    let hotkey = current_shortcut().map(|k| windows_hotkey(&k)).transpose().map_err(other)?.unwrap_or_default();
+    winsys::write_shortcut(&link, &launch_path()?, &hotkey)?;
+    Ok(link)
+}
+
+#[cfg(windows)]
+pub fn remove_launcher() -> io::Result<()> {
+    let _ = shortcut_state().and_then(fs::remove_file);
+    match fs::remove_file(start_menu_link()?) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// The keys used until the user chooses others. Windows hot keys need
+/// Ctrl and Alt together.
+#[cfg(windows)]
+pub const DEFAULT_SHORTCUT: &str = "Ctrl+Alt+F";
+
+/// "Ctrl+Alt+F" as a shell link hot key ("CTRL+ALT+F").
+#[cfg(windows)]
+fn windows_hotkey(label: &str) -> Result<String, String> {
+    let parts: Vec<&str> = label.split('+').collect();
+    let (key, mods) = parts.split_last().ok_or("no key given")?;
+    if mods.contains(&"Super") {
+        return Err("Windows shortcuts cannot use the Windows key; use Ctrl+Alt, such as Ctrl+Alt+F".into());
+    }
+    if !(mods.contains(&"Ctrl") && mods.contains(&"Alt")) && !key.starts_with('F') {
+        return Err("on Windows a shortcut needs Ctrl+Alt, such as Ctrl+Alt+F".into());
+    }
+    let mut out: Vec<String> = mods.iter().map(|m| m.to_uppercase()).collect();
+    out.push(key.to_uppercase());
+    Ok(out.join("+"))
+}
+
+#[cfg(windows)]
+pub fn shortcut_enabled() -> bool {
+    launcher_installed() && shortcut_state().is_ok_and(|s| s.exists())
+}
+
+#[cfg(windows)]
+pub fn current_shortcut() -> Option<String> {
+    let text = fs::read_to_string(shortcut_state().ok()?).ok()?;
+    let keys = text.trim();
+    (!keys.is_empty()).then(|| keys.to_string())
+}
+
+/// Nothing to mend on Windows.
+#[cfg(windows)]
+pub fn repair_shortcut() {}
+
+/// Sets the hot key `keys` (as in "Ctrl+Alt+F") on the Start menu
+/// shortcut, creating it if needed, or takes the hot key away.
+#[cfg(windows)]
+pub fn set_shortcut(on: bool, keys: &str) -> io::Result<bool> {
+    let link = start_menu_link()?;
+    let state = shortcut_state()?;
+    if on {
+        let label = shortcut_label(&shortcut_binding(keys).map_err(other)?);
+        let hotkey = windows_hotkey(&label).map_err(other)?;
+        winsys::write_shortcut(&link, &launch_path()?, &hotkey)?;
+        fs::create_dir_all(state.parent().unwrap_or(Path::new(".")))?;
+        fs::write(&state, label)?;
+    } else {
+        if link.exists() {
+            winsys::write_shortcut(&link, &launch_path()?, "")?;
+        }
+        let _ = fs::remove_file(&state);
+    }
+    Ok(on)
+}
+
+#[cfg(windows)]
+const DAEMON_CONFIG: &str = r"C:\ProgramData\ff\ffd.conf";
+
+/// The service program, next to this one.
+#[cfg(windows)]
+fn ffd_path() -> io::Result<PathBuf> {
+    let ffd = std::env::current_exe()?.with_file_name("ffd.exe");
+    if ffd.exists() { Ok(ffd) } else { Err(other(format!("{} not found", ffd.display()))) }
+}
+
+#[cfg(windows)]
+pub fn daemon_installed() -> bool {
+    winsys::reg_key_exists(winsys::HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\ffd")
+}
+
+/// Installs or removes the `ffd` service; Windows asks for administrator
+/// rights first. Blocks until answered; returns a status bar message.
+#[cfg(windows)]
+pub fn set_daemon(install: bool) -> String {
+    let run = || -> io::Result<String> {
+        let arg = if install { "--install-service" } else { "--uninstall-service" };
+        match winsys::run_elevated(&ffd_path()?, &[arg.to_string()])? {
+            0 if install => Ok("Live updates are on: the ffd service is running".into()),
+            0 => Ok("Live updates are off: the ffd service was removed".into()),
+            code => Err(other(format!("ffd failed (exit code {code})"))),
+        }
+    };
+    run().unwrap_or_else(|e| format!("Live updates not changed: {e}"))
+}
+
+/// The local fixed drives, with the service's settings for them.
+#[cfg(windows)]
+pub fn drives() -> Vec<Drive> {
+    let config = fs::read_to_string(DAEMON_CONFIG).unwrap_or_default();
+    let has = |key: &str, path: &str| config.lines().any(|l| l.split_whitespace().eq([key, path]));
+    let automatic = drives_automatic();
+    ff_core::win::fixed_drives()
+        .into_iter()
+        .map(|root| {
+            let mount = root.to_string_lossy().into_owned();
+            let path = mount.trim_end_matches(std::path::MAIN_SEPARATOR).to_string();
+            let (fstype, bytes) = winsys::volume_info(&root);
+            Drive {
+                can_index: true,
+                index: if automatic { !has("skip", &path) } else { has("include", &path) },
+                live: !has("nolive", &path),
+                size: ff_core::sizes::human_size(bytes),
+                fstype: fstype.to_lowercase(),
+                path,
+                mount,
+            }
+        })
+        .collect()
+}
+
+/// Saves the drive settings through the service (which restarts itself),
+/// asking for administrator rights. Returns a status bar message.
+#[cfg(windows)]
+pub fn apply_drives(
+    settings: Vec<(String, bool, bool, bool)>,
+    automatic: bool,
+    excludes: Vec<String>,
+    no_hidden: bool,
+) -> String {
+    let run = || -> io::Result<String> {
+        match winsys::run_elevated(&ffd_path()?, &configure_args(&settings, automatic, &excludes, no_hidden))? {
+            0 => Ok("Index settings saved; the index is being rebuilt".into()),
+            code => Err(other(format!("ffd failed (exit code {code})"))),
         }
     };
     run().unwrap_or_else(|e| format!("Index settings not changed: {e}"))

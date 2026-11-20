@@ -11,7 +11,7 @@ pub use ff_core::sizes::{Kept, Tile, Tree};
 use crate::backend::{Key, Mods};
 use crate::canvas::{Icon, ON_ACCENT};
 use crate::i18n::{tr, trf};
-use crate::x11::*;
+use crate::keys::*;
 use crate::{Action, App, DIM, LINE, Menu, PANEL, SELECT, TEXT, WHITE};
 
 // ---- the view, inside the main window ----------------------------------
@@ -86,7 +86,9 @@ impl App {
     /// it is too narrow for a map).
     fn tree_split(&self) -> i32 {
         let w = self.cv.w as i32;
-        if w < 640 * self.u { w } else { (w * 46 / 100).max(380 * self.u) }
+        // The map can be turned off (View > Size map, F7): the tree then
+        // takes the whole width.
+        if w < 640 * self.u || !self.flag(crate::Flag::SizeMap) { w } else { (w * 46 / 100).max(380 * self.u) }
     }
 
     /// (x, width) of the Name, Size, Files and Share columns.
@@ -136,6 +138,7 @@ impl App {
         let last = tree.rows.len().saturating_sub(1);
         match key {
             Key::Sym(K_ESCAPE | K_F6) => self.toggle_tree(),
+            Key::Sym(K_F7) => self.act(Action::Toggle(crate::Flag::SizeMap), 0),
             Key::Sym(K_UP) => tree.sel = tree.sel.saturating_sub(1),
             Key::Sym(K_DOWN) => tree.sel = (tree.sel + 1).min(last),
             Key::Sym(K_PAGE_UP) => tree.sel = tree.sel.saturating_sub(page),

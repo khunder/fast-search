@@ -56,7 +56,7 @@ pub fn trf(template: &str, values: &[&dyn std::fmt::Display]) -> String {
 }
 
 /// English text and its [French, Spanish, Italian] translations.
-const TEXTS: [(&str, [&str; 3]); 305] = [
+const TEXTS: [(&str, [&str; 3]); 310] = [
     ("File", ["Fichier", "Archivo", "File"]),
     ("Edit", ["Édition", "Editar", "Modifica"]),
     ("View", ["Affichage", "Ver", "Visualizza"]),
@@ -120,6 +120,11 @@ const TEXTS: [(&str, [&str; 3]); 305] = [
     ("folder", ["dossier", "carpeta", "cartella"]),
     ("{} bytes", ["{} octets", "{} bytes", "{} byte"]),
     ("Indexing...", ["Indexation...", "Indexando...", "Indicizzazione..."]),
+    ("Indexing... {} entries", ["Indexation... {} éléments", "Indexando... {} elementos", "Indicizzazione... {} elementi"]),
+    ("Indexed {} entries in {} s", ["{} éléments indexés en {} s", "{} elementos indexados en {} s", "{} elementi indicizzati in {} s"]),
+    ("Size map", ["Carte des tailles", "Mapa de tamaños", "Mappa delle dimensioni"]),
+    ("Show the size map beside the folder sizes", ["Afficher la carte des tailles à côté des dossiers", "Mostrar el mapa de tamaños junto a las carpetas", "Mostra la mappa delle dimensioni accanto alle cartelle"]),
+    ("show or hide the size map beside the folder sizes", ["afficher ou masquer la carte des tailles", "mostrar u ocultar el mapa de tamaños", "mostra o nascondi la mappa delle dimensioni"]),
     ("Opening {}", ["Ouverture de {}", "Abriendo {}", "Apertura di {}"]),
     ("Opening {} items", ["Ouverture de {} éléments", "Abriendo {} elementos", "Apertura di {} elementi"]),
     ("Opening {} in the text editor", ["Ouverture de {} dans l'éditeur de texte", "Abriendo {} en el editor de texto", "Apertura di {} nell'editor di testo"]),

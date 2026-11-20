@@ -1,5 +1,6 @@
 //! Optional diagnostics: lines appended to the file named by FF_GUI_DEBUG.
 
+#[cfg_attr(windows, allow(dead_code))] // only the X11 backend asks
 pub fn enabled() -> bool {
     std::env::var_os("FF_GUI_DEBUG").is_some()
 }

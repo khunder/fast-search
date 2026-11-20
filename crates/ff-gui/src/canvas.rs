@@ -2,7 +2,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::process::Command;
 
 /// The window content as 32-bit BGRX pixels, ready to send to the X server.
 pub struct Canvas {
@@ -252,10 +251,36 @@ pub struct Text {
     pub height: i32,
 }
 
+#[cfg(not(windows))]
 fn fc_match(pattern: &str) -> Option<String> {
-    let out = Command::new("fc-match").args(["-f", "%{file}", pattern]).output().ok()?;
+    let out = std::process::Command::new("fc-match").args(["-f", "%{file}", pattern]).output().ok()?;
     let file = String::from_utf8(out.stdout).ok()?;
     (!file.is_empty()).then_some(file)
+}
+
+/// The Windows fonts folder.
+#[cfg(windows)]
+fn fonts_dir() -> std::path::PathBuf {
+    let windir = std::env::var_os("WINDIR").or_else(|| std::env::var_os("SystemRoot")).unwrap_or_else(|| "C:\\Windows".into());
+    std::path::PathBuf::from(windir).join("Fonts")
+}
+
+/// Windows has no fontconfig. The default face comes from the fixed
+/// list in `Text::load`; for a character missing there, the first font
+/// of a list of wide-coverage system fonts that has it.
+#[cfg(windows)]
+fn fc_match(pattern: &str) -> Option<String> {
+    let ch = char::from_u32(u32::from_str_radix(pattern.strip_prefix(":charset=")?, 16).ok()?)?;
+    let fallbacks = [
+        "seguisym.ttf", "seguiemj.ttf", "msyh.ttc", "YuGothR.ttc", "malgun.ttf", "Nirmala.ttc", "Nirmala.ttf",
+        "seguihis.ttf", "ebrima.ttf", "tahoma.ttf", "arial.ttf", "simsun.ttc",
+    ];
+    fallbacks.iter().map(|f| fonts_dir().join(f)).filter(|p| p.exists()).find_map(|path| {
+        let data = std::fs::read(&path).ok()?;
+        let face = ttf_parser::Face::parse(&data, 0).ok()?;
+        face.glyph_index(ch)?;
+        path.to_str().map(String::from)
+    })
 }
 
 fn load_font(path: &str) -> Option<Face> {
@@ -292,6 +317,11 @@ impl Text {
     pub fn load(px: f32) -> io::Result<Text> {
         let mut candidates: Vec<String> = std::env::var("FF_GUI_FONT").into_iter().collect();
         candidates.extend(fc_match("sans"));
+        #[cfg(windows)]
+        candidates.extend(
+            ["segoeui.ttf", "SegUIVar.ttf", "arial.ttf", "tahoma.ttf", "verdana.ttf"]
+                .map(|f| fonts_dir().join(f).to_string_lossy().into_owned()),
+        );
         candidates.extend(
             [
                 "/usr/share/fonts/truetype/DejaVuSans.ttf",
