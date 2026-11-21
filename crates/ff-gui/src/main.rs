@@ -55,6 +55,8 @@ USAGE:
   ff-gui --install     add Fast search to the applications menu, with its icon
   ff-gui --shortcut on|off|KEYS   make a global shortcut open Fast search
                        (GNOME): Alt+E, or the KEYS you give, e.g. Ctrl+Alt+F
+  ff-gui --hidden      (Windows) start in the notification area, no window:
+                       how it starts at sign-in
 
 KEYS:
   type               search as you type (same term syntax as `ff`)
@@ -150,6 +152,9 @@ enum Action {
     Toggle(Flag),
     /// Colours: 0 follow the desktop, 1 light, 2 dark.
     Theme(u8),
+    /// Start at sign-in, in the notification area (Windows).
+    #[cfg(windows)]
+    ToggleAutostart,
     /// 0: the desktop's accent colour; n: canvas::ACCENTS[n - 1].
     Accent(u8),
     /// 0 follow the system, 1 English, 2 French, 3 Spanish, 4 Italian.
@@ -535,6 +540,8 @@ fn main() -> ExitCode {
 
 fn run() -> ExitCode {
     let mut db = None;
+    // Started at sign-in: to the notification area, no window.
+    let mut hidden = false;
     let mut query = Vec::new();
     let mut args = std::env::args();
     args.next();
@@ -559,6 +566,7 @@ fn run() -> ExitCode {
                     }
                 };
             }
+            "--hidden" => hidden = true,
             "--db" => db = args.next().map(PathBuf::from),
             "--shortcut" => {
                 // "on" uses the keys chosen before (Alt+E at first).
@@ -626,11 +634,17 @@ fn run() -> ExitCode {
         }
     }
     // Already running (perhaps hidden in the notification area): show that
-    // window, which has the index loaded, instead of starting again. Test
-    // runs, which draw one frame and exit, always start their own.
+    // window, which has the index loaded, instead of starting again; a
+    // hidden start (at sign-in) then has nothing to do. Test runs, which
+    // draw one frame and exit, always start their own.
     #[cfg(windows)]
-    if std::env::var_os("FF_GUI_SNAPSHOT").is_none() && std::env::var_os("FF_GUI_TEST").is_none() && win_tray::wake_running(WINDOW_TITLE) {
-        return ExitCode::SUCCESS;
+    if std::env::var_os("FF_GUI_SNAPSHOT").is_none() && std::env::var_os("FF_GUI_TEST").is_none() {
+        if hidden && win_tray::running(WINDOW_TITLE) {
+            return ExitCode::SUCCESS;
+        }
+        if !hidden && win_tray::wake_running(WINDOW_TITLE) {
+            return ExitCode::SUCCESS;
+        }
     }
     let follow_default = db.is_none();
     let Some(db) = db.or_else(ff_core::default_db_path) else {
@@ -639,7 +653,7 @@ fn run() -> ExitCode {
     };
     // Mends a shortcut saved wrongly by an earlier version, out of the way.
     std::thread::spawn(settings::repair_shortcut);
-    match App::new(db, follow_default, query.join(" ")).and_then(|mut app| app.run()) {
+    match App::new(db, follow_default, query.join(" "), hidden).and_then(|mut app| app.run()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("ff-gui: {e}");
@@ -744,13 +758,13 @@ fn drag_label(paths: &str) -> String {
 }
 
 impl App {
-    fn new(db: PathBuf, follow_default: bool, query: String) -> io::Result<App> {
+    fn new(db: PathBuf, follow_default: bool, query: String, hidden: bool) -> io::Result<App> {
         let config = Config::load();
         let (notice_tx, notices) = mpsc::channel();
         // FF_GUI_SCALE beats the saved zoom, which beats the desktop scale.
         let env_scale = std::env::var("FF_GUI_SCALE").ok().and_then(|v| v.parse::<f32>().ok());
         let fixed = env_scale.or(config.scale).map(|s| s.clamp(0.5, 8.0));
-        let mut b = backend::connect(&WindowSpec { title: WINDOW_TITLE, width: 1000, height: 640, scale: fixed })?;
+        let mut b = backend::connect(&WindowSpec { title: WINDOW_TITLE, width: 1000, height: 640, scale: fixed, hidden })?;
         let auto_scale = if env_scale.is_some() { env_scale.unwrap() } else { b.scale() };
         debug(format!("display: {} at scale {auto_scale}", b.name()));
         let scale = fixed.unwrap_or(auto_scale);
@@ -1685,6 +1699,16 @@ impl App {
                 }
                 return;
             }
+            #[cfg(windows)]
+            Action::ToggleAutostart => {
+                let on = !settings::autostart_enabled();
+                self.status = match settings::set_autostart(on) {
+                    Ok(()) if on => "Fast search starts at sign-in, in the notification area".into(),
+                    Ok(()) => "Fast search no longer starts at sign-in".into(),
+                    Err(e) => format!("could not change the start at sign-in: {e}"),
+                };
+                return;
+            }
             Action::ToggleLauncher => {
                 let done = if settings::launcher_installed() { settings::remove_launcher() } else { settings::install_launcher().map(drop) };
                 self.status = match done {
@@ -1918,6 +1942,8 @@ impl App {
                     Row::Check("Show in the applications menu", Action::ToggleLauncher),
                     #[cfg(windows)]
                     Row::Check("Closing the window keeps it in the notification area", Action::Toggle(Flag::CloseToTray)),
+                    #[cfg(windows)]
+                    Row::Check("Start at sign-in, in the notification area", Action::ToggleAutostart),
                 ],
             ),
             5 => (
@@ -2232,6 +2258,8 @@ impl App {
             Action::TreeSize => self.tree.is_some(),
             Action::Case(case) => case == self.case,
             Action::ToggleTitleBar => self.custom_title,
+            #[cfg(windows)]
+            Action::ToggleAutostart => settings::autostart_enabled(),
             Action::ToggleShortcut => self.shortcut_on,
             Action::ToggleLauncher => self.launcher_on,
             Action::ToggleDaemon => self.daemon_on,

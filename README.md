@@ -516,6 +516,8 @@ What differs from Linux:
   to the notification area, index loaded: the shortcut, or starting
   `ff-gui` again, shows it at once. *File → Quit*, Ctrl+Q or the tray
   icon's *Exit* quit for real; *Options → Desktop* turns the hiding off.
+  There too, *Start at sign-in* starts it hidden when you sign in (also
+  a choice in the installer), so the shortcut is instant from the start.
 - **Live updates:** `ffd` watches each drive with `ReadDirectoryChangesW`
   and publishes `C:\ProgramData\ff\index.db`, which `ff` and `ff-gui` then
   use. Install it as a service from an administrator prompt (or from the

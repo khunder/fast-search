@@ -157,3 +157,10 @@ pub fn wake_running(title: &str) -> bool {
         PostMessageW(hwnd, SHOW_MESSAGE, 0, 0) != 0
     }
 }
+
+/// True if the program already runs (its window may be hidden).
+pub fn running(title: &str) -> bool {
+    let (class, title) = (wide(CLASS), wide(title));
+    // SAFETY: NUL-terminated strings.
+    !unsafe { FindWindowW(class.as_ptr(), title.as_ptr()) }.is_null()
+}

@@ -907,7 +907,13 @@ impl Win32 {
                 SendMessageW(main, WM_SETICON, kind, make_icon(size) as LPARAM);
             }
             match_title_bar(main, crate::canvas::is_dark());
-            ShowWindow(main, SW_SHOW);
+            // Started at sign-in: straight to the notification area.
+            if spec.hidden {
+                with(|s| s.tray = true);
+                crate::win_tray::add(main, tray_icon(main));
+            } else {
+                ShowWindow(main, SW_SHOW);
+            }
             let size = client_size(main);
             with(|s| {
                 s.size = size;

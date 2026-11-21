@@ -71,6 +71,8 @@ unsafe extern "system" {
     ) -> i32;
     fn RegOpenKeyExW(key: HKEY, subkey: *const u16, options: u32, access: u32, out: *mut HKEY) -> i32;
     fn RegCloseKey(key: HKEY) -> i32;
+    fn RegSetKeyValueW(key: HKEY, subkey: *const u16, value: *const u16, kind: u32, data: *const c_void, len: u32) -> i32;
+    fn RegDeleteKeyValueW(key: HKEY, subkey: *const u16, value: *const u16) -> i32;
 }
 
 #[link(name = "shell32")]
@@ -258,4 +260,35 @@ mod tests {
         assert_eq!(quote_arg("say \"hi\""), "\"say \\\"hi\\\"\"");
         assert_eq!(quote_arg(""), "\"\"");
     }
+}
+
+/// Sets a string value (REG_SZ) under `key`, creating the key if needed.
+pub fn reg_set_string(root: HKEY, key: &str, value: &str, data: &str) -> std::io::Result<()> {
+    const REG_SZ: u32 = 1;
+    let (key, value, data) = (wide(key), wide(value), wide(data));
+    // SAFETY: NUL-terminated strings; the data length counts its NUL.
+    let r = unsafe { RegSetKeyValueW(root, key.as_ptr(), value.as_ptr(), REG_SZ, data.as_ptr().cast(), (data.len() * 2) as u32) };
+    if r == 0 { Ok(()) } else { Err(std::io::Error::from_raw_os_error(r)) }
+}
+
+/// Removes a value; one that is not there is fine.
+pub fn reg_delete_value(root: HKEY, key: &str, value: &str) -> std::io::Result<()> {
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    let (key, value) = (wide(key), wide(value));
+    // SAFETY: NUL-terminated strings.
+    match unsafe { RegDeleteKeyValueW(root, key.as_ptr(), value.as_ptr()) } {
+        0 | ERROR_FILE_NOT_FOUND => Ok(()),
+        r => Err(std::io::Error::from_raw_os_error(r)),
+    }
+}
+
+/// True if a string value exists.
+pub fn reg_string_exists(root: HKEY, key: &str, value: &str) -> bool {
+    const RRF_RT_REG_SZ: u32 = 0x2;
+    let (key, value) = (wide(key), wide(value));
+    // SAFETY: no data buffer: only whether the value is there.
+    let r = unsafe {
+        RegGetValueW(root, key.as_ptr(), value.as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+    };
+    r == 0
 }

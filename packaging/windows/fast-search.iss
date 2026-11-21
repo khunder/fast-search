@@ -55,6 +55,7 @@ WizardStyle=modern
 [Tasks]
 Name: path; Description: "Add ff to the PATH (use it from any terminal)"
 Name: desktopicon; Description: "Create a desktop shortcut"; Flags: unchecked
+Name: startup; Description: "Start at sign-in, in the notification area (Ctrl+Alt+F then opens it at once)"; Flags: unchecked
 Name: service; Description: "Install the ffd service: keeps the index current, and reads NTFS drives directly (fast)"; Flags: unchecked; Check: IsAdminInstallMode
 
 [Files]
@@ -68,6 +69,11 @@ Source: "..\..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignor
 ; The same shortcut the window's Options create: it carries the hot key.
 Name: "{autoprograms}\Fast search"; Filename: "{app}\ff-gui.exe"; WorkingDir: "{app}"; Comment: "Find files instantly by name"; HotKey: ctrl+alt+f
 Name: "{autodesktop}\Fast search"; Filename: "{app}\ff-gui.exe"; WorkingDir: "{app}"; Comment: "Find files instantly by name"; Tasks: desktopicon
+
+[Registry]
+; The same entry as the window's Options > Desktop > Start at sign-in
+; (settings.rs: RUN_VALUE).
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Fast search"; ValueData: """{app}\ff-gui.exe"" --hidden"; Tasks: startup
 
 [Run]
 Filename: "{app}\ffd.exe"; Parameters: "--install-service"; Flags: runhidden waituntilterminated; StatusMsg: "Starting the ffd service..."; Tasks: service
@@ -154,5 +160,9 @@ end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
-  if CurUninstallStep = usPostUninstall then RemoveFromPath;
+  if CurUninstallStep = usPostUninstall then begin
+    RemoveFromPath;
+    { Start at sign-in may have been set from the window, not by Setup. }
+    RegDeleteValue(HKEY_CURRENT_USER, 'Software\Microsoft\Windows\CurrentVersion\Run', 'Fast search');
+  end;
 end;

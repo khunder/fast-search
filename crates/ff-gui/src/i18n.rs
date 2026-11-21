@@ -224,6 +224,7 @@ const TEXTS: &[(&str, [&str; 3])] = &[
     ("Closing the window keeps it in the notification area", ["Fermer la fenêtre la garde dans la zone de notification", "Cerrar la ventana la mantiene en el área de notificación", "Chiudere la finestra la tiene nell'area di notifica"]),
     ("Open Fast search", ["Ouvrir Fast search", "Abrir Fast search", "Apri Fast search"]),
     ("Exit", ["Quitter", "Salir", "Esci"]),
+    ("Start at sign-in, in the notification area", ["Démarrer à l'ouverture de session, dans la zone de notification", "Iniciar al iniciar sesión, en el área de notificación", "Avvia all'accesso, nell'area di notifica"]),
     ("Keep the index current with the live updates service", ["Tenir l'index à jour avec le service de mise à jour en direct", "Mantener el índice actualizado con el servicio en vivo", "Mantieni l'indice aggiornato con il servizio in tempo reale"]),
     ("Switching it asks for your password. Everyone in your group can then", ["Le changer demande votre mot de passe. Tous les membres de votre groupe pourront", "Cambiarlo pide su contraseña. Todos los miembros de su grupo podrán", "Cambiarlo richiede la password. Tutti i membri del tuo gruppo potranno"]),
     ("search the names of all files on this computer.", ["rechercher les noms de tous les fichiers de cet ordinateur.", "buscar los nombres de todos los archivos de este equipo.", "cercare i nomi di tutti i file di questo computer."]),

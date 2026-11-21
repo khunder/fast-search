@@ -586,6 +586,30 @@ fn start_menu_link() -> io::Result<PathBuf> {
 fn shortcut_state() -> io::Result<PathBuf> {
     Ok(ff_core::os::config_dir().ok_or_else(|| other("APPDATA is not set"))?.join("ff").join("shortcut.txt"))
 }
+/// Where Windows keeps the programs to start at sign-in, for this user.
+#[cfg(windows)]
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+/// Our entry there.
+#[cfg(windows)]
+pub const RUN_VALUE: &str = "Fast search";
+
+/// True if Fast search starts at sign-in (hidden, in the notification area).
+#[cfg(windows)]
+pub fn autostart_enabled() -> bool {
+    winsys::reg_string_exists(winsys::HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE)
+}
+
+/// Makes Fast search start at sign-in, or not. It starts this program,
+/// wherever it is, hidden.
+#[cfg(windows)]
+pub fn set_autostart(on: bool) -> io::Result<()> {
+    if !on {
+        return winsys::reg_delete_value(winsys::HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
+    }
+    let exe = ff_core::os::strip_verbatim(std::env::current_exe()?);
+    winsys::reg_set_string(winsys::HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, &format!("\"{}\" --hidden", exe.display()))
+}
+
 
 #[cfg(windows)]
 pub fn launcher_installed() -> bool {

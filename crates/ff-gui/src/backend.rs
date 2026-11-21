@@ -136,6 +136,10 @@ pub struct WindowSpec<'a> {
     /// Size at a scale of 1; the backend multiplies by the scale it finds.
     pub width: i32,
     pub height: i32,
+    /// Start hidden: in the notification area only (Windows; elsewhere the
+    /// window shows as usual).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub hidden: bool,
     /// Fixed scale from the user, overriding the desktop's.
     pub scale: Option<f32>,
 }
