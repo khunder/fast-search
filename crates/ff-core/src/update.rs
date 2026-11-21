@@ -128,6 +128,17 @@ pub fn download(release: &Release) -> io::Result<PathBuf> {
 pub fn install(installer: &std::path::Path, reopen_window: bool) -> io::Result<()> {
     let mut cmd = Command::new(installer);
     cmd.args(["/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS"]);
+    // Name the folder and the mode of this install: Windows may run any
+    // "setup" program elevated, which would otherwise install for all
+    // users, in Program Files, next to a copy installed for one user.
+    if let Some(dir) = installed_folder() {
+        let program_files = std::env::var_os("ProgramFiles").map(PathBuf::from);
+        let for_all = program_files.is_some_and(|p| dir.starts_with(p));
+        cmd.arg(if for_all { "/ALLUSERS" } else { "/CURRENTUSER" });
+        let mut arg = std::ffi::OsString::from("/DIR=");
+        arg.push(dir.as_os_str());
+        cmd.arg(arg);
+    }
     if reopen_window {
         cmd.arg("/STARTGUI=1");
     }

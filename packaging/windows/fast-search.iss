@@ -55,7 +55,7 @@ WizardStyle=modern
 [Tasks]
 Name: path; Description: "Add ff to the PATH (use it from any terminal)"
 Name: desktopicon; Description: "Create a desktop shortcut"; Flags: unchecked
-Name: service; Description: "Install the ffd service: keeps the index current, and reads NTFS drives directly (fast)"; Check: IsAdminInstallMode
+Name: service; Description: "Install the ffd service: keeps the index current, and reads NTFS drives directly (fast)"; Flags: unchecked; Check: IsAdminInstallMode
 
 [Files]
 Source: "{#BinDir}\ff.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -76,7 +76,9 @@ Filename: "{app}\ff-gui.exe"; Description: "Start Fast search"; Flags: nowait po
 Filename: "{app}\ff-gui.exe"; Flags: nowait runasoriginaluser; Check: StartGuiAfterUpdate
 
 [UninstallRun]
-Filename: "{app}\ffd.exe"; Parameters: "--uninstall-service"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveService"; Check: ServiceInstalled
+; Checks here are made at install time, before any service exists: so
+; this runs for every all-users install, and ffd ignores a missing service.
+Filename: "{app}\ffd.exe"; Parameters: "--uninstall-service"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveService"; Check: IsAdminInstallMode
 
 [Code]
 const
