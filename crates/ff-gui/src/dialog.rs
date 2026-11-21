@@ -394,8 +394,9 @@ impl App {
                 Row::Button(label, action) => {
                     let Some(index) = item_at(Item::RowButton(*action)) else { continue };
                     let (x, by, bw, bh, _) = layout.items[index];
-                    d.cv.fill(x, by, bw, bh, if d.hover == Some(index) { 0xdcdcdc } else { 0xececec });
-                    d.cv.frame(x, by, bw, bh, line, if d.focus == index { 0x5b9bea } else { 0xa8a8a8 });
+                    let fill = if d.hover == Some(index) { HOVER } else { WHITE };
+                    let edge = if d.focus == index { SELECT } else { LINE };
+                    d.cv.round_frame(x, by, bw, bh, 4 * u, line, edge, fill);
                     self.text.draw(&mut d.cv, x + 14 * u, by + (bh - self.text.height) / 2, label, bw, TEXT);
                 }
                 Row::ListItem(label, action) => {
@@ -455,15 +456,15 @@ impl App {
             let main = i == last && d.buttons[i].1.is_some();
             let (fill, ink) = match (main, d.danger, d.hover == Some(index)) {
                 (true, true, hovered) => (if hovered { 0xb3261e } else { 0xd93025 }, ON_ACCENT),
-                (true, false, hovered) => (if hovered { 0x1557ad } else { SELECT }, ON_ACCENT),
-                (false, _, true) => (0xdcdcdc, TEXT),
-                (false, _, false) => (0xececec, TEXT),
+                (true, false, _) => (SELECT, ON_ACCENT),
+                (false, _, true) => (HOVER, TEXT),
+                (false, _, false) => (WHITE, TEXT),
             };
-            d.cv.fill(x, by, bw, bh, fill);
-            d.cv.frame(x, by, bw, bh, line, if main { fill } else { 0xa8a8a8 });
+            // Windows 11 buttons: rounded; the focus ring follows the shape.
             if d.focus == index {
-                d.cv.frame(x - 3 * u, by - 3 * u, bw + 6 * u, bh + 6 * u, line, 0x5b9bea); // focus ring
+                d.cv.round_frame(x - 3 * u, by - 3 * u, bw + 6 * u, bh + 6 * u, 7 * u, 2 * line, TEXT, palette::BASE);
             }
+            d.cv.round_frame(x, by, bw, bh, 4 * u, line, if main { fill } else { LINE }, fill);
             let lx = x + (bw - self.text.width(label)) / 2;
             self.text.draw(&mut d.cv, lx, by + (bh - self.text.height) / 2, label, bw, ink);
         }

@@ -6,8 +6,13 @@
 //! the picked paths can be captured: `vim "$(ff -i)"`.
 
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
+#[cfg(unix)]
+use std::io::Read;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant, SystemTime};
@@ -56,6 +61,7 @@ pub fn run(db: PathBuf, index: Index, start: Start) -> Result<ExitCode, String> 
 
 // ---- the terminal -----------------------------------------------------------
 
+#[cfg(unix)]
 mod sys {
     use std::ffi::{c_int, c_short, c_ulong};
 
@@ -89,7 +95,6 @@ mod sys {
         pub fn kill(pid: c_int, signal: c_int) -> c_int;
         pub fn getpid() -> c_int;
         pub fn signal(signal: c_int, handler: usize) -> usize;
-        pub fn isatty(fd: c_int) -> c_int;
     }
 
     pub const SIGINT: c_int = 2;
@@ -103,10 +108,109 @@ mod sys {
     pub const SIGTSTP: c_int = 20;
 }
 
+/// The Windows console, driven with the same escape sequences: Windows 10
+/// and later understand them once "virtual terminal" mode is on, in both
+/// directions (keys and mouse clicks then arrive as escape sequences too).
+#[cfg(windows)]
+mod sys {
+    #![allow(non_snake_case)]
+    use std::ffi::c_void;
+
+    pub type Handle = *mut c_void;
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct Coord {
+        pub x: i16,
+        pub y: i16,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct SmallRect {
+        pub left: i16,
+        pub top: i16,
+        pub right: i16,
+        pub bottom: i16,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct ScreenBufferInfo {
+        pub size: Coord,
+        pub cursor: Coord,
+        pub attributes: u16,
+        pub window: SmallRect,
+        pub max_size: Coord,
+    }
+
+    /// An `INPUT_RECORD`, with the event read as a key event (the only
+    /// kind whose fields we look at).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct InputRecord {
+        pub event_type: u16,
+        pub _pad: u16,
+        pub key_down: i32,
+        pub repeat: u16,
+        pub vk: u16,
+        pub scan: u16,
+        pub ch: u16,
+        pub control: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn GetConsoleMode(h: Handle, mode: *mut u32) -> i32;
+        pub fn SetConsoleMode(h: Handle, mode: u32) -> i32;
+        pub fn GetConsoleOutputCP() -> u32;
+        pub fn SetConsoleOutputCP(cp: u32) -> i32;
+        pub fn GetConsoleScreenBufferInfo(h: Handle, info: *mut ScreenBufferInfo) -> i32;
+        pub fn WaitForSingleObject(h: Handle, ms: u32) -> u32;
+        pub fn PeekConsoleInputW(h: Handle, buf: *mut InputRecord, len: u32, read: *mut u32) -> i32;
+        pub fn ReadConsoleInputW(h: Handle, buf: *mut InputRecord, len: u32, read: *mut u32) -> i32;
+        pub fn ReadConsoleW(h: Handle, buf: *mut u16, len: u32, read: *mut u32, control: *const c_void) -> i32;
+        pub fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
+    }
+
+    pub const ENABLE_PROCESSED_INPUT: u32 = 0x1;
+    pub const ENABLE_LINE_INPUT: u32 = 0x2;
+    pub const ENABLE_ECHO_INPUT: u32 = 0x4;
+    pub const ENABLE_WINDOW_INPUT: u32 = 0x8;
+    pub const ENABLE_MOUSE_INPUT: u32 = 0x10;
+    pub const ENABLE_QUICK_EDIT_MODE: u32 = 0x40;
+    pub const ENABLE_EXTENDED_FLAGS: u32 = 0x80;
+    pub const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x200;
+    pub const ENABLE_PROCESSED_OUTPUT: u32 = 0x1;
+    pub const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x4;
+    pub const DISABLE_NEWLINE_AUTO_RETURN: u32 = 0x8;
+    pub const KEY_EVENT: u16 = 1;
+    pub const WAIT_OBJECT_0: u32 = 0;
+    pub const CP_UTF8: u32 = 65001;
+
+    /// A console control handler that swallows Ctrl+C: while an editor
+    /// runs in the console, Ctrl+C is meant for it, not for us.
+    pub unsafe extern "system" fn ignore_ctrl_c(_: u32) -> i32 {
+        1
+    }
+}
+
 struct Term {
+    /// Where the screen is drawn: `/dev/tty`, or the Windows console's
+    /// output (`CONOUT$`), so standard output stays free for the result.
     tty: File,
+    /// The console's input (`CONIN$`); on Unix `tty` serves both ways.
+    #[cfg(windows)]
+    conin: File,
     /// The settings to put back when we leave.
+    #[cfg(unix)]
     saved: sys::Termios,
+    /// Input mode, output mode and output code page to put back.
+    #[cfg(windows)]
+    saved: (u32, u32, u32),
+    /// The first half of a UTF-16 surrogate pair, until the second comes.
+    #[cfg(windows)]
+    high_surrogate: Option<u16>,
     /// Bytes read but not yet turned into keys.
     input: Vec<u8>,
     /// The bytes of the last key we could not make sense of.
@@ -114,6 +218,7 @@ struct Term {
     active: bool,
 }
 
+#[cfg(unix)]
 impl Term {
     fn open() -> io::Result<Term> {
         let tty = std::fs::OpenOptions::new()
@@ -175,6 +280,133 @@ impl Term {
         Ok(n > 0)
     }
 
+    /// Standard handles for a program that takes over the terminal.
+    fn child_stdio(&self) -> io::Result<(Stdio, Stdio, Stdio)> {
+        let tty = |t: &File| t.try_clone().map(Stdio::from);
+        Ok((tty(&self.tty)?, tty(&self.tty)?, tty(&self.tty)?))
+    }
+}
+
+#[cfg(windows)]
+impl Term {
+    fn open() -> io::Result<Term> {
+        let no_console = |_| io::Error::other("ff -i needs a console to draw on");
+        let console = |name| std::fs::OpenOptions::new().read(true).write(true).open(name).map_err(no_console);
+        let tty = console("CONOUT$")?;
+        let conin = console("CONIN$")?;
+        let (mut input_mode, mut output_mode) = (0, 0);
+        // SAFETY: valid console handles and out-pointers.
+        let ok = unsafe {
+            sys::GetConsoleMode(conin.as_raw_handle(), &mut input_mode) != 0
+                && sys::GetConsoleMode(tty.as_raw_handle(), &mut output_mode) != 0
+        };
+        if !ok {
+            return Err(io::Error::other("ff -i needs a console to draw on"));
+        }
+        // SAFETY: no arguments.
+        let code_page = unsafe { sys::GetConsoleOutputCP() };
+        let saved = (input_mode, output_mode, code_page);
+        let mut term = Term { tty, conin, saved, high_surrogate: None, input: Vec::new(), unknown: Vec::new(), active: false };
+        term.enter()?;
+        Ok(term)
+    }
+
+    /// Raw keys as escape sequences, our own screen, mouse clicks and the
+    /// wheel, UTF-8 output.
+    fn enter(&mut self) -> io::Result<()> {
+        use sys::*;
+        let input = (self.saved.0
+            & !(ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_MOUSE_INPUT | ENABLE_QUICK_EDIT_MODE))
+            | ENABLE_VIRTUAL_TERMINAL_INPUT
+            | ENABLE_WINDOW_INPUT
+            | ENABLE_EXTENDED_FLAGS;
+        let output = self.saved.1 | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
+        // SAFETY: valid console handles.
+        let ok = unsafe {
+            SetConsoleMode(self.conin.as_raw_handle(), input) != 0
+                && SetConsoleMode(self.tty.as_raw_handle(), output) != 0
+                && SetConsoleOutputCP(CP_UTF8) != 0
+        };
+        if !ok {
+            self.restore();
+            return Err(io::Error::other("this console does not understand escape sequences (Windows 10 or later is needed)"));
+        }
+        self.tty.write_all(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?7l")?;
+        self.active = true;
+        Ok(())
+    }
+
+    fn restore(&mut self) {
+        // SAFETY: valid console handles; the values were read at start.
+        unsafe {
+            sys::SetConsoleMode(self.conin.as_raw_handle(), self.saved.0);
+            sys::SetConsoleMode(self.tty.as_raw_handle(), self.saved.1);
+            sys::SetConsoleOutputCP(self.saved.2);
+        }
+    }
+
+    fn leave(&mut self) {
+        if std::mem::take(&mut self.active) {
+            let _ = self.tty.write_all(b"\x1b[?7h\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l");
+            self.restore();
+        }
+    }
+
+    /// (rows, columns) of the visible window.
+    fn size(&self) -> (usize, usize) {
+        let mut info = sys::ScreenBufferInfo::default();
+        // SAFETY: a valid console handle and out-pointer.
+        let ok = unsafe { sys::GetConsoleScreenBufferInfo(self.tty.as_raw_handle(), &mut info) } != 0;
+        let rows = (info.window.bottom - info.window.top + 1) as usize;
+        let cols = (info.window.right - info.window.left + 1) as usize;
+        if ok && rows > 0 && cols > 0 { (rows, cols) } else { (24, 80) }
+    }
+
+    /// Reads what has arrived, waiting at most `wait`; false if nothing did.
+    fn fill(&mut self, wait: Duration) -> io::Result<bool> {
+        let h = self.conin.as_raw_handle();
+        let ms = wait.as_millis().min(u32::MAX as u128 - 1) as u32;
+        // SAFETY: a valid console input handle.
+        if unsafe { sys::WaitForSingleObject(h, ms) } != sys::WAIT_OBJECT_0 {
+            return Ok(false);
+        }
+        // Something is waiting, but maybe only focus or resize events,
+        // which reading text would block on: those are taken off here.
+        let mut records = [sys::InputRecord::default(); 64];
+        let mut n = 0;
+        // SAFETY: the buffer holds `records.len()` records.
+        if unsafe { sys::PeekConsoleInputW(h, records.as_mut_ptr(), records.len() as u32, &mut n) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let typed = records[..n as usize].iter().any(|r| r.event_type == sys::KEY_EVENT && r.key_down != 0 && r.ch != 0);
+        if !typed {
+            // SAFETY: as above; reads exactly the records just seen.
+            unsafe { sys::ReadConsoleInputW(h, records.as_mut_ptr(), n, &mut n) };
+            return Ok(false); // a resize: the next draw picks up the size
+        }
+        let mut buf = [0u16; 2048];
+        let mut got = 0;
+        // SAFETY: the buffer holds `buf.len()` UTF-16 units.
+        if unsafe { sys::ReadConsoleW(h, buf.as_mut_ptr(), buf.len() as u32, &mut got, std::ptr::null()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut units: Vec<u16> = self.high_surrogate.take().into_iter().collect();
+        units.extend_from_slice(&buf[..got as usize]);
+        if units.last().is_some_and(|u| (0xD800..0xDC00).contains(u)) {
+            self.high_surrogate = units.pop();
+        }
+        self.input.extend_from_slice(String::from_utf16_lossy(&units).as_bytes());
+        Ok(!units.is_empty())
+    }
+
+    /// Standard handles for a program that takes over the console.
+    fn child_stdio(&self) -> io::Result<(Stdio, Stdio, Stdio)> {
+        let clone = |t: &File| t.try_clone().map(Stdio::from);
+        Ok((clone(&self.conin)?, clone(&self.tty)?, clone(&self.tty)?))
+    }
+}
+
+impl Term {
     /// The next key, waiting at most `wait` for one.
     fn next_key(&mut self, wait: Duration) -> io::Result<Option<Key>> {
         loop {
@@ -484,7 +716,14 @@ const HELP: &[(&str, &str)] = &[
     ("Alt+P", "print the selected paths and quit"),
     ("Tab, Shift+Tab", "mark several results; Enter and the keys below act on all of them"),
     ("Ctrl+O", "open with the default application"),
-    ("F4, Alt+E", "edit in $VISUAL or $EDITOR (else vi), in this terminal"),
+    (
+        "F4, Alt+E",
+        if cfg!(windows) {
+            "edit in %VISUAL% or %EDITOR% (else Notepad)"
+        } else {
+            "edit in $VISUAL or $EDITOR (else vi), in this terminal"
+        },
+    ),
     ("Alt+S", "edit with sudoedit; Enter and F4 do that for files you cannot change"),
     ("", "(if sudo is refused, the file opens read-only)"),
     ("Ctrl+G", "show in the file manager"),
@@ -584,8 +823,8 @@ impl Ui {
             size,
             paint,
             null: start.null,
-            // SAFETY: isatty only looks at the descriptor.
-            capture: unsafe { sys::isatty(1) } == 0,
+            // Standard output captured, as in `vim "$(ff -i)"`.
+            capture: !std::io::IsTerminal::is_terminal(&io::stdout()),
         }
     }
 
@@ -792,7 +1031,7 @@ impl Ui {
     /// The keys that act on files, the same in both views.
     fn action_key(&mut self, key: Key) -> io::Result<Option<End>> {
         let Some(&id) = self.targets().first() else { return Ok(None) };
-        let path = PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(self.path(id)));
+        let path = PathBuf::from(ff_core::os::os_string_from_vec(self.path(id)));
         match key {
             Key::Ctrl('o') => match desktop() {
                 true => self.done(ff_core::desktop::open(&path), &path, "Opened"),
@@ -849,7 +1088,7 @@ impl Ui {
     }
 
     fn target_paths(&self) -> Vec<PathBuf> {
-        self.targets().into_iter().map(|id| PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(self.path(id)))).collect()
+        self.targets().into_iter().map(|id| PathBuf::from(ff_core::os::os_string_from_vec(self.path(id)))).collect()
     }
 
     fn pick(&self) -> Option<End> {
@@ -987,9 +1226,10 @@ impl Ui {
         if paths.is_empty() {
             return Ok(());
         }
-        let editor = ["VISUAL", "EDITOR"].iter().find_map(|v| std::env::var(v).ok().filter(|e| !e.trim().is_empty())).unwrap_or_else(|| "vi".into());
+        let editor = ["VISUAL", "EDITOR"].iter().find_map(|v| std::env::var(v).ok().filter(|e| !e.trim().is_empty())).unwrap_or_else(|| DEFAULT_EDITOR.into());
         let all_files = paths.iter().all(|p| p.symlink_metadata().is_ok_and(|m| !m.is_dir()));
-        let sudo = all_files && (force_sudo || paths.iter().any(|p| !may(p, 2)));
+        // Windows has no sudoedit: a file the user may not change opens anyway.
+        let sudo = cfg!(unix) && all_files && (force_sudo || paths.iter().any(|p| !may(p, 2)));
         let stamp = |p: &PathBuf| std::fs::metadata(p).ok().map(|m| (m.modified().ok(), m.len()));
         let before: Vec<_> = paths.iter().map(stamp).collect();
         let what = if paths.len() == 1 { paths[0].display().to_string() } else { format!("{} files", paths.len()) };
@@ -1037,37 +1277,26 @@ impl Ui {
         if !notice.is_empty() {
             let _ = writeln!(self.term.tty, "{notice}\r");
         }
-        let tty = |t: &File| t.try_clone().map(Stdio::from);
-        command.stdin(tty(&self.term.tty)?).stdout(tty(&self.term.tty)?).stderr(tty(&self.term.tty)?);
-        // Ctrl+C at the password prompt, or in the editor, is meant for
-        // them: like system(3), we ignore it while they run, and they get
-        // the usual handling back.
-        use std::os::unix::process::CommandExt;
-        // SAFETY: signal() is async-signal-safe, as pre_exec requires.
-        unsafe {
-            command.pre_exec(|| {
-                sys::signal(sys::SIGINT, sys::SIG_DFL);
-                sys::signal(sys::SIGQUIT, sys::SIG_DFL);
-                Ok(())
-            });
-        }
-        // SAFETY: setting and restoring dispositions; no handler code runs.
-        let saved = unsafe { (sys::signal(sys::SIGINT, sys::SIG_IGN), sys::signal(sys::SIGQUIT, sys::SIG_IGN)) };
-        let status = command.status();
-        unsafe {
-            sys::signal(sys::SIGINT, saved.0);
-            sys::signal(sys::SIGQUIT, saved.1);
-        }
+        let (stdin, stdout, stderr) = self.term.child_stdio()?;
+        command.stdin(stdin).stdout(stdout).stderr(stderr);
+        let status = run_ignoring_ctrl_c(command);
         self.term.enter()?;
         Ok(status)
     }
 
     /// Ctrl+Z: back to the shell; `fg` brings the screen back.
+    #[cfg(unix)]
     fn suspend(&mut self) {
         self.term.leave();
         // SAFETY: stopping ourselves; execution resumes here on SIGCONT.
         unsafe { sys::kill(sys::getpid(), sys::SIGTSTP) };
         let _ = self.term.enter();
+    }
+
+    /// Windows consoles have no job control to go back to.
+    #[cfg(windows)]
+    fn suspend(&mut self) {
+        self.note("Ctrl+Z does nothing here: Windows consoles cannot suspend a program".to_string());
     }
 
     // ---- folder sizes ---------------------------------------------------------------
@@ -1385,6 +1614,7 @@ fn line_text(s: &str) -> String {
 /// The editor on these files; `read_only` adds the flag that makes the
 /// common terminal editors refuse to save. (Any other editor cannot save
 /// either: the user has no permission to.)
+#[cfg(unix)]
 fn editor_command(editor: &str, paths: &[PathBuf], read_only: bool) -> Command {
     let program = editor.split_whitespace().next().unwrap_or("");
     let flag = match program.rsplit('/').next().unwrap_or(program) {
@@ -1399,8 +1629,78 @@ fn editor_command(editor: &str, paths: &[PathBuf], read_only: bool) -> Command {
     command
 }
 
+/// On Windows the editor setting is split on spaces (`code -w`), with a
+/// quoted program path kept whole (`"C:\Program Files\x\x.exe" -n`).
+#[cfg(windows)]
+fn editor_command(editor: &str, paths: &[PathBuf], read_only: bool) -> Command {
+    let editor = editor.trim();
+    let (program, rest) = match editor.strip_prefix('"').and_then(|e| e.split_once('"')) {
+        Some((program, rest)) => (program, rest),
+        None => editor.split_once(' ').unwrap_or((editor, "")),
+    };
+    let name = program.rsplit(['\\', '/']).next().unwrap_or(program).trim_end_matches(".exe").to_ascii_lowercase();
+    let mut command = Command::new(program);
+    command.args(rest.split_whitespace());
+    if read_only {
+        match name.as_str() {
+            "vi" | "vim" | "nvim" | "view" | "gvim" => {
+                command.arg("-R");
+            }
+            "nano" => {
+                command.arg("-v");
+            }
+            _ => {}
+        }
+    }
+    command.args(paths);
+    command
+}
+
+/// The editor when neither `$VISUAL` nor `$EDITOR` is set.
+#[cfg(unix)]
+const DEFAULT_EDITOR: &str = "vi";
+#[cfg(windows)]
+const DEFAULT_EDITOR: &str = "notepad";
+
+/// Runs a program that has the terminal, waiting for it. Ctrl+C at a
+/// password prompt, or in the editor, is meant for it: like system(3),
+/// we ignore it while it runs, and it gets the usual handling.
+#[cfg(unix)]
+fn run_ignoring_ctrl_c(mut command: Command) -> io::Result<std::process::ExitStatus> {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: signal() is async-signal-safe, as pre_exec requires.
+    unsafe {
+        command.pre_exec(|| {
+            sys::signal(sys::SIGINT, sys::SIG_DFL);
+            sys::signal(sys::SIGQUIT, sys::SIG_DFL);
+            Ok(())
+        });
+    }
+    // SAFETY: setting and restoring dispositions; no handler code runs.
+    let saved = unsafe { (sys::signal(sys::SIGINT, sys::SIG_IGN), sys::signal(sys::SIGQUIT, sys::SIG_IGN)) };
+    let status = command.status();
+    unsafe {
+        sys::signal(sys::SIGINT, saved.0);
+        sys::signal(sys::SIGQUIT, saved.1);
+    }
+    status
+}
+
+/// On Windows, Ctrl+C reaches every program on the console; a handler
+/// that swallows it keeps us alive (handlers are not inherited, so the
+/// editor still gets its own).
+#[cfg(windows)]
+fn run_ignoring_ctrl_c(mut command: Command) -> io::Result<std::process::ExitStatus> {
+    // SAFETY: adding and removing a handler that only returns a value.
+    unsafe { sys::SetConsoleCtrlHandler(Some(sys::ignore_ctrl_c), 1) };
+    let status = command.status();
+    unsafe { sys::SetConsoleCtrlHandler(Some(sys::ignore_ctrl_c), 0) };
+    status
+}
+
 /// True if we may use the file in a way (`mode`: 4 read, 2 write), as
 /// `access(2)` says, which knows about groups and read-only filesystems.
+#[cfg(unix)]
 fn may(path: &Path, mode: i32) -> bool {
     use std::os::unix::ffi::OsStrExt;
     unsafe extern "C" {
@@ -1411,9 +1711,23 @@ fn may(path: &Path, mode: i32) -> bool {
     unsafe { access(path.as_ptr(), mode) == 0 }
 }
 
+/// Only asked on the way to sudoedit, which Windows does not have.
+#[cfg(windows)]
+fn may(_: &Path, _: i32) -> bool {
+    true
+}
+
 /// True when a graphical desktop is there to open files on.
+#[cfg(not(windows))]
 fn desktop() -> bool {
     ["WAYLAND_DISPLAY", "DISPLAY"].iter().any(|v| std::env::var_os(v).is_some_and(|d| !d.is_empty()))
+}
+
+/// A Windows session always has one (over SSH there is no window station
+/// to show it on, but opening then fails with a message).
+#[cfg(windows)]
+fn desktop() -> bool {
+    true
 }
 
 #[cfg(test)]

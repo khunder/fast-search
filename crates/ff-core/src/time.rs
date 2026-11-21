@@ -203,8 +203,26 @@ impl TimeZone {
         Some(TimeZone { transitions, first_offset: offset_of(0).unwrap_or(0), after })
     }
 
+    /// The zone this machine is set to, as Windows reports it (with its
+    /// daylight-saving rule); UTC if it cannot be read.
+    #[cfg(windows)]
+    pub fn system() -> TimeZone {
+        // Windows describes the zone as a bias and two yearly rules, the
+        // same shape as a POSIX TZ string.
+        let Some(tz) = crate::win::time_zone() else { return TimeZone::default() };
+        let std_offset = -(tz.Bias + tz.StandardBias) * 60;
+        let rule = |d: &crate::win::SYSTEMTIME| {
+            let day = RuleDay::MonthWeekDay(d.wMonth as i64, d.wDay as i64, d.wDayOfWeek as i64);
+            (day, d.wHour as i64 * 3600 + d.wMinute as i64 * 60 + d.wSecond as i64)
+        };
+        let dst = (tz.DaylightDate.wMonth != 0 && tz.StandardDate.wMonth != 0 && tz.DynamicDaylightTimeDisabled == 0)
+            .then(|| (-(tz.Bias + tz.DaylightBias) * 60, rule(&tz.DaylightDate), rule(&tz.StandardDate)));
+        TimeZone { transitions: Vec::new(), first_offset: std_offset, after: Some(PosixTz { std_offset, dst }) }
+    }
+
     /// The zone this machine is set to: `$TZ` if it names one, else
     /// /etc/localtime; UTC if neither can be read.
+    #[cfg(not(windows))]
     pub fn system() -> TimeZone {
         let named = std::env::var("TZ").ok().filter(|tz| !tz.is_empty()).map(|tz| {
             let name = tz.trim_start_matches(':');

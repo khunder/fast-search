@@ -6,7 +6,7 @@ use ff_core::complete::suggestions;
 
 use crate::backend::{Key, Mods};
 use crate::i18n::tr;
-use crate::x11::*;
+use crate::keys::*;
 use crate::{App, DIM, HOVER, TEXT, WHITE};
 
 /// The open list.

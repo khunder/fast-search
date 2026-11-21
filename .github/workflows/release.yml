@@ -1,11 +1,13 @@
 name: Release
 
-# Pushing a tag like v0.2.0 tests, builds the packages and publishes them
-# as a GitHub release. It can also be run by hand to check the packaging;
-# the packages are then attached to the workflow run instead.
+# Pushing a tag like v0.2.0 (or 0.2.0) tests, builds the packages and the
+# Windows installer and publishes them as a GitHub release; the programs
+# report the tag as their version, and `ff update` installs from it. It
+# can also be run by hand to check the packaging; the packages are then
+# attached to the workflow run instead.
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "[0-9]*"]
   workflow_dispatch:
 
 permissions:
@@ -16,6 +18,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Take the version from the tag
+        run: echo "FF_VERSION=$(sh packaging/version.sh)" >> "$GITHUB_ENV"
 
       - name: Install build tools
         run: |
@@ -53,8 +58,46 @@ jobs:
           name: packages
           path: dist/
 
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Take the version from the tag
+        shell: bash
+        run: echo "FF_VERSION=$(sh packaging/version.sh)" >> "$GITHUB_ENV"
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Test
+        run: cargo test --target x86_64-pc-windows-msvc
+      - name: Build
+        run: cargo win
+      - name: Check the version
+        shell: bash
+        run: target/x86_64-pc-windows-msvc/release/ff.exe --version | grep -Fx "ff $FF_VERSION"
+      - name: Build the installer
+        shell: pwsh
+        run: packaging/windows/build-installer.ps1
+      - name: Zip the programs
+        shell: pwsh
+        run: |
+          $bin = "target/x86_64-pc-windows-msvc/release"
+          Compress-Archive -Path "$bin/ff.exe", "$bin/ff-gui.exe", "$bin/ffd.exe", README.md, LICENSE -DestinationPath dist/fast-search-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-package
+          path: dist/
+
+  publish:
+    needs: [packages, windows]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - name: Publish the release
-        if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

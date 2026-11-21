@@ -1,8 +1,8 @@
 //! Client-side drawing: a pixel buffer, anti-aliased text and file icons.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(not(windows))]
 use std::io;
-use std::process::Command;
 
 /// The window content as 32-bit BGRX pixels, ready to send to the X server.
 pub struct Canvas {
@@ -13,25 +13,140 @@ pub struct Canvas {
     pub clip: (i32, i32),
 }
 
-static DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static THEME: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Switches all drawing between the light and the dark palette.
-pub fn set_dark(dark: bool) {
-    DARK.store(dark, std::sync::atomic::Ordering::Relaxed);
+/// Switches all drawing to theme `THEMES[index]`.
+pub fn set_theme(index: usize) {
+    THEME.store(index.min(THEMES.len() - 1), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// White that stays white in both palettes: text on a coloured fill.
+/// True if the current theme is dark.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn is_dark() -> bool {
+    theme().dark
+}
+
+/// The theme drawing uses now.
+fn theme() -> &'static Theme {
+    &THEMES[THEME.load(std::sync::atomic::Ordering::Relaxed)]
+}
+
+/// White that stays white in every theme: text on a coloured fill.
 pub const ON_ACCENT: u32 = 0xff_fffe;
 
-/// The colour to really draw for a colour of the light palette. In the
-/// dark palette greys are flipped (white paper becomes near-black, dark
-/// ink becomes light), pale tints become deep ones of the same hue, and
-/// strong colours such as the selection blue stay as they are.
+/// The accent colour: the desktop's (Windows) or a blue, drawn a shade
+/// lighter in dark themes. See [`set_accent`].
+pub const ACCENT: u32 = 0xff_fffd;
+
+static ACCENT_RGB: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x00_67c0);
+
+/// Sets the colour [`ACCENT`] stands for.
+pub fn set_accent(rgb: u32) {
+    ACCENT_RGB.store(rgb & 0xff_ffff, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The surfaces and inks every theme defines. Drawing code uses these
+/// values (those of the Light theme); [`tone`] turns them into the
+/// current theme's. They must differ from any other colour drawn.
+pub mod palette {
+    /// The window behind everything (Windows' "Mica").
+    pub const BASE: u32 = 0xf3f3f3;
+    /// The results list, a layer above the base.
+    pub const CARD: u32 = 0xfbfbfb;
+    /// Text boxes, menus and dialogs.
+    pub const FIELD: u32 = 0xffffff;
+    /// Hairlines and borders.
+    pub const STROKE: u32 = 0xe5e5e5;
+    /// A row or item under the pointer.
+    pub const HOVER: u32 = 0xf0f0f0;
+    /// A selected row.
+    pub const PICKED: u32 = 0xe9e9e9;
+    pub const INK: u32 = 0x1b1b1b;
+    pub const DIM_INK: u32 = 0x616161;
+    /// Scrollbar thumbs and other quiet controls.
+    pub const QUIET: u32 = 0x8a8a8a;
+
+    /// In the order of [`super::Theme::colors`].
+    pub(super) const ALL: [u32; 9] = [BASE, CARD, FIELD, STROKE, HOVER, PICKED, INK, DIM_INK, QUIET];
+}
+
+/// A colour theme: its [`palette`] colours, and whether it is dark (other
+/// greys are then flipped and the accent lightened).
+pub struct Theme {
+    pub name: &'static str,
+    pub dark: bool,
+    /// Base, card, field, stroke, hover, picked, ink, dim ink, quiet.
+    colors: [u32; 9],
+}
+
+/// Accent colours to choose instead of the desktop's (Windows 11's own),
+/// as (menu label, 0xRRGGBB). The first is also the default where the
+/// desktop has none.
+pub const ACCENTS: [(&str, u32); 7] = [
+    ("Blue accent", 0x0067c0),
+    ("Teal accent", 0x038387),
+    ("Green accent", 0x107c10),
+    ("Orange accent", 0xca5010),
+    ("Red accent", 0xc42b1c),
+    ("Purple accent", 0x744da9),
+    ("Grey accent", 0x5d5a58),
+];
+
+/// Every theme. Adding one is one entry here.
+pub const THEMES: [Theme; 6] = [
+    Theme { name: "Light", dark: false, colors: palette::ALL },
+    Theme {
+        name: "Dark",
+        dark: true,
+        colors: [0x202020, 0x272727, 0x2d2d2d, 0x3a3a3a, 0x323232, 0x383838, 0xf3f3f3, 0xababab, 0x9a9a9a],
+    },
+    Theme {
+        name: "Graphite (dark grey)",
+        dark: true,
+        colors: [0x2b2b2b, 0x333333, 0x3a3a3a, 0x494949, 0x3e3e3e, 0x464646, 0xeeeeee, 0xb2b2b2, 0xa2a2a2],
+    },
+    Theme {
+        name: "Mist (light grey)",
+        dark: false,
+        colors: [0xe3e5e8, 0xeef0f2, 0xf8f9fa, 0xd2d5da, 0xe1e4e8, 0xd7dbe0, 0x1d2126, 0x585e66, 0x878d95],
+    },
+    Theme {
+        name: "Dusk (blue-grey dark)",
+        dark: true,
+        colors: [0x1d2330, 0x242b39, 0x2b3343, 0x3a4458, 0x30394b, 0x39445a, 0xe5e9f1, 0xa2acbe, 0x8d98ac],
+    },
+    Theme {
+        name: "Sand (warm light)",
+        dark: false,
+        colors: [0xf1eadd, 0xf9f5ec, 0xfffcf5, 0xe2d7c3, 0xede4d4, 0xe6d9c2, 0x2b2419, 0x6a5e4b, 0x9a8d78],
+    },
+];
+
+/// The colour to really draw for a colour of the Light theme. The
+/// [`palette`] colours take the current theme's values. In a dark theme
+/// other greys are flipped (white paper becomes near-black, dark ink
+/// becomes light), pale tints become deep ones of the same hue, and
+/// strong colours stay as they are.
 pub fn tone(color: u32) -> u32 {
+    let theme = theme();
+    let dark = theme.dark;
     if color == ON_ACCENT {
         return 0xff_ffff;
     }
-    if !DARK.load(std::sync::atomic::Ordering::Relaxed) {
+    if color == ACCENT {
+        let rgb = ACCENT_RGB.load(std::sync::atomic::Ordering::Relaxed);
+        if !dark {
+            return rgb;
+        }
+        // Windows uses a lighter accent on dark: mix 45% white in.
+        let [b, g, r] = bgr(rgb).map(|c| c as u32);
+        let light = |c: u32| c + (255 - c) * 45 / 100;
+        return light(r) << 16 | light(g) << 8 | light(b);
+    }
+    if let Some(i) = palette::ALL.iter().position(|&c| c == color) {
+        return theme.colors[i];
+    }
+    if !dark {
         return color;
     }
     let [b, g, r] = bgr(color).map(|c| c as u32);
@@ -79,6 +194,43 @@ impl Canvas {
         }
     }
 
+    /// Fills a rectangle with corners rounded to radius `r`, anti-aliased.
+    pub fn round(&mut self, x: i32, y: i32, w: i32, h: i32, r: i32, color: u32) {
+        let r = r.min(w / 2).min(h / 2).max(0);
+        if r == 0 {
+            return self.fill(x, y, w, h, color);
+        }
+        self.fill(x, y + r, w, h - 2 * r, color);
+        self.fill(x + r, y, w - 2 * r, r, color);
+        self.fill(x + r, y + h - r, w - 2 * r, r, color);
+        let c = bgr(tone(color));
+        let rf = r as f32;
+        // The four corners: coverage from 4x4 samples per pixel.
+        for dy in 0..r {
+            for dx in 0..r {
+                let mut inside = 0;
+                for s in 0..16 {
+                    let px = dx as f32 + (s % 4) as f32 * 0.25 + 0.125;
+                    let py = dy as f32 + (s / 4) as f32 * 0.25 + 0.125;
+                    let (ex, ey) = (rf - px, rf - py);
+                    inside += (ex <= 0.0 || ey <= 0.0 || ex * ex + ey * ey <= rf * rf) as u32;
+                }
+                let a = inside * 255 / 16;
+                self.blend(x + dx, y + dy, c, a);
+                self.blend(x + w - 1 - dx, y + dy, c, a);
+                self.blend(x + dx, y + h - 1 - dy, c, a);
+                self.blend(x + w - 1 - dx, y + h - 1 - dy, c, a);
+            }
+        }
+    }
+
+    /// A rounded outline `t` thick, drawn as a rounded fill of `color`
+    /// with a rounded fill of `inside` on top.
+    pub fn round_frame(&mut self, x: i32, y: i32, w: i32, h: i32, r: i32, t: i32, color: u32, inside: u32) {
+        self.round(x, y, w, h, r, color);
+        self.round(x + t, y + t, w - 2 * t, h - 2 * t, (r - t).max(0), inside);
+    }
+
     /// A 1-`t`-thick rectangle outline.
     pub fn frame(&mut self, x: i32, y: i32, w: i32, h: i32, t: i32, color: u32) {
         self.fill(x, y, w, t, color);
@@ -100,6 +252,18 @@ impl Canvas {
         }
     }
 }
+
+/// Windows draws text with GDI (`gdi_text.rs`); elsewhere text is drawn
+/// from the font outlines here.
+#[cfg(windows)]
+pub use crate::gdi_text::Text;
+#[cfg(not(windows))]
+pub use ttf_text::Text;
+
+#[cfg(not(windows))]
+mod ttf_text {
+use super::*;
+use std::collections::HashSet;
 
 struct Glyph {
     advance: f32,
@@ -253,10 +417,11 @@ pub struct Text {
 }
 
 fn fc_match(pattern: &str) -> Option<String> {
-    let out = Command::new("fc-match").args(["-f", "%{file}", pattern]).output().ok()?;
+    let out = std::process::Command::new("fc-match").args(["-f", "%{file}", pattern]).output().ok()?;
     let file = String::from_utf8(out.stdout).ok()?;
     (!file.is_empty()).then_some(file)
 }
+
 
 fn load_font(path: &str) -> Option<Face> {
     // Fonts stay loaded for the life of the program.
@@ -400,6 +565,7 @@ impl Text {
         }
     }
 }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Icon {
@@ -461,28 +627,7 @@ impl Icon {
             u >= x0 && u <= x1 && v >= y0 && v <= y1 && dx * dx + dy * dy <= r * r
         };
         if self == Icon::App {
-            // An almond: the overlap of two circles, one centred below
-            // and one above the middle. `r` shrinks it for the outline.
-            let almond = |r: f32| {
-                let dx2 = (u - 0.5).powi(2);
-                dx2 + (v - 0.74).powi(2) <= r * r && dx2 + (v - 0.26).powi(2) <= r * r
-            };
-            if !almond(0.51) {
-                return None;
-            }
-            if !almond(0.455) {
-                return Some(0xf08a1c); // eyelid outline
-            }
-            let from = |cx: f32, cy: f32| ((u - cx).powi(2) + (v - cy).powi(2)).sqrt();
-            return Some(if from(0.555, 0.445) <= 0.035 {
-                0xffffff // glint
-            } else if from(0.5, 0.5) <= 0.085 {
-                0x2b2118 // pupil
-            } else if from(0.5, 0.5) <= 0.17 {
-                0xc96a12 // iris
-            } else {
-                0xfdfdfd
-            });
+            return crate::app_icon::sample(u, v);
         }
         if self == Icon::Folder {
             return if rounded(0.05, 0.27, 0.95, 0.87, 0.07) {
@@ -532,25 +677,7 @@ impl Icon {
 impl Icon {
     /// Renders the icon as `size` x `size` BGRA pixels.
     pub fn render(self, size: usize) -> Vec<[u8; 4]> {
-        // 4x4 supersampling gives smooth edges.
-        const N: usize = 4;
-        let step = 1.0 / (size * N) as f32;
-        (0..size * size)
-            .map(|i| {
-                let (px, py) = (i % size, i / size);
-                let mut sum = [0u32; 4];
-                for s in 0..N * N {
-                    let u = ((px * N + s % N) as f32 + 0.5) * step;
-                    let v = ((py * N + s / N) as f32 + 0.5) * step;
-                    if let Some(c) = self.sample(u, v) {
-                        let [b, g, r] = bgr(c);
-                        sum = [sum[0] + b as u32, sum[1] + g as u32, sum[2] + r as u32, sum[3] + 1];
-                    }
-                }
-                let n = sum[3].max(1);
-                [(sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8, (sum[3] * 255 / (N * N) as u32) as u8]
-            })
-            .collect()
+        crate::app_icon::render(size, |u, v| self.sample(u, v))
     }
 }
 

@@ -1,10 +1,9 @@
-use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufWriter, Write};
-use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(unix)]
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
@@ -12,15 +11,19 @@ unsafe extern "C" {
 
 /// An index file mapped into memory, read-only. Its pages are the
 /// system's own copy of the file, shared by every program that maps it.
+#[cfg(unix)]
 struct Map {
     at: *mut u8,
     len: usize,
 }
 
 // SAFETY: the mapping is never written through and lives until dropped.
+#[cfg(unix)]
 unsafe impl Send for Map {}
+#[cfg(unix)]
 unsafe impl Sync for Map {}
 
+#[cfg(unix)]
 impl Map {
     fn open(path: &Path) -> io::Result<Map> {
         use std::os::fd::AsRawFd;
@@ -44,11 +47,33 @@ impl Map {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Map {
     fn drop(&mut self) {
         // SAFETY: exactly the range `open` mapped.
         unsafe { munmap(self.at, self.len) };
     }
+}
+
+/// On Windows the index is read, not mapped: a mapped file cannot be
+/// replaced, and the daemon replaces its index on every update.
+#[cfg(not(unix))]
+struct Map;
+
+#[cfg(not(unix))]
+impl Map {
+    fn open(_: &Path) -> io::Result<Map> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &[]
+    }
+}
+
+/// True if a stored name ends in a path separator (a root like `/` or `C:\`).
+fn ends_with_sep(name: &[u8]) -> bool {
+    name.last().is_some_and(|&b| crate::os::is_sep(b))
 }
 
 /// One column of the index: values of our own, or values read straight
@@ -187,7 +212,7 @@ impl Index {
     /// Directories skipped at build time.
     pub fn excludes(&self) -> impl Iterator<Item = PathBuf> + '_ {
         let folders = self.excludes.iter().filter(|e| e.as_slice() != crate::walk::HIDDEN_MARK);
-        folders.map(|e| OsString::from_vec(e.clone()).into())
+        folders.map(|e| crate::os::path_from_bytes(e))
     }
 
     /// True if names starting with a dot were left out when building.
@@ -203,7 +228,7 @@ impl Index {
     pub fn path(&self, id: u32) -> PathBuf {
         let mut buf = Vec::new();
         self.write_path(id, &mut buf);
-        OsString::from_vec(buf).into()
+        crate::os::os_string_from_vec(buf).into()
     }
 
     /// Writes the full path of `id` into `buf` (replacing its contents).
@@ -219,7 +244,7 @@ impl Index {
             if p == NO_PARENT {
                 break;
             }
-            len += !self.name(p).ends_with(b"/") as usize;
+            len += !ends_with_sep(self.name(p)) as usize;
             cur = p;
         }
         // Pass 2: fill from the back.
@@ -235,9 +260,9 @@ impl Index {
             if p == NO_PARENT {
                 break;
             }
-            if !self.name(p).ends_with(b"/") {
+            if !ends_with_sep(self.name(p)) {
                 end -= 1;
-                buf[end] = b'/';
+                buf[end] = crate::os::SEP;
             }
             cur = p;
         }

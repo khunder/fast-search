@@ -1,7 +1,6 @@
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, BufWriter, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -18,6 +17,7 @@ USAGE:
   ff -i                         search interactively in the terminal
   ff index [ROOT...] [-x DIR]   build or rebuild the index
   ff stats                      show index information
+  ff update                     install the newest release (Windows)
 
 TERMS:
   foo        name contains \"foo\" (case-insensitive unless it has uppercase)
@@ -129,7 +129,7 @@ fn run() -> Result<ExitCode, String> {
                 return Ok(ExitCode::SUCCESS);
             }
             "-V" | "--version" => {
-                println!("ff {}", env!("CARGO_PKG_VERSION"));
+                println!("ff {}", ff_core::update::VERSION);
                 return Ok(ExitCode::SUCCESS);
             }
             "-f" | "--files" => a.kind = Kind::File,
@@ -181,6 +181,7 @@ fn run() -> Result<ExitCode, String> {
     match a.free.first().and_then(|f| f.to_str()).filter(|_| !only_free) {
         Some("index") => cmd_index(&a, &db),
         Some("stats") => cmd_stats(&db),
+        Some("update") => cmd_update(),
         Some("help") => {
             print!("{USAGE}");
             Ok(ExitCode::SUCCESS)
@@ -228,7 +229,7 @@ fn cmd_index(a: &Args, db: &PathBuf) -> Result<ExitCode, String> {
     let only_devices = !a.devices.is_empty() && a.free.len() == 1;
     let mut index = if only_devices { Index::new() } else { Index::build(&opts).map_err(|e| e.to_string())? };
     for device in &a.devices {
-        let name = std::os::unix::ffi::OsStrExt::as_bytes(device.as_os_str());
+        let name = ff_core::os::path_bytes(device);
         let read = ff_core::rawfs::scan(device, name).map_err(|e| format!("{}: {e}", device.display()))?;
         index.append(&read);
     }
@@ -295,7 +296,7 @@ fn cmd_search(a: &Args, db: &PathBuf) -> Result<ExitCode, String> {
         match_path: a.match_path,
         wildcards_anywhere: a.wildcards_anywhere,
     };
-    let query = Query::from_terms_opts(a.free.iter().map(|t| t.as_bytes()), &options);
+    let query = Query::from_terms_opts(a.free.iter().map(|t| ff_core::os::bytes(t)), &options);
     if let Some(problem) = query.error() {
         return Err(problem.to_string());
     }
@@ -352,4 +353,25 @@ fn print_hits(a: &Args, index: &Index, hits: &[u32]) -> io::Result<()> {
         out.write_all(if a.null { b"\0" } else { b"\n" })?;
     }
     out.flush()
+}
+
+/// `ff update`: installs the newest release over this one (Windows), or
+/// says whether there is one (elsewhere, packages update the programs).
+fn cmd_update() -> Result<ExitCode, String> {
+    #[cfg(windows)]
+    {
+        let done = ff_core::update::update(false, |step| eprintln!("{step}")).map_err(|e| e.to_string())?;
+        eprintln!("{done}");
+    }
+    #[cfg(not(windows))]
+    {
+        let release = ff_core::update::latest().map_err(|e| e.to_string())?;
+        if release.is_newer() {
+            eprintln!("Fast search {} is available: {}", release.version(), release.page());
+            eprintln!("update it with your package manager, or download the new package there");
+        } else {
+            eprintln!("Fast search is up to date ({})", ff_core::update::VERSION);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }

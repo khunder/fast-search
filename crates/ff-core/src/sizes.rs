@@ -177,10 +177,11 @@ impl Tree {
 
     /// The entry with that full path, if it is in the index.
     fn find(&self, index: &Index, path: &[u8]) -> Option<u32> {
-        let inside = |root: &[u8]| path.strip_prefix(root).filter(|rest| rest.is_empty() || rest[0] == b'/' || root.ends_with(b"/"));
+        let sep = crate::os::is_sep;
+        let inside = |root: &[u8]| path.strip_prefix(root).filter(|rest| rest.is_empty() || sep(rest[0]) || root.last().is_some_and(|&b| sep(b)));
         let root = self.roots.iter().copied().filter(|&r| inside(index.name(r)).is_some()).max_by_key(|&r| index.name(r).len())?;
         let rest = inside(index.name(root))?;
-        rest.split(|&b| b == b'/').filter(|part| !part.is_empty()).try_fold(root, |dir, part| self.kids(dir).iter().copied().find(|&k| index.name(k) == part))
+        rest.split(|&b| sep(b)).filter(|part| !part.is_empty()).try_fold(root, |dir, part| self.kids(dir).iter().copied().find(|&k| index.name(k) == part))
     }
 
     pub fn keep(&self, index: &Index) -> Kept {
@@ -209,7 +210,13 @@ impl Tree {
             if tree.find(index, p).is_some_and(|id| tree.reveal(index, id)) {
                 break;
             }
-            path = p.iter().rposition(|&b| b == b'/').filter(|&i| i > 0).map(|i| &p[..i]);
+            // The parent; for `C:\x` that is the root `C:\`, kept whole.
+            path = p.iter().rposition(|&b| crate::os::is_sep(b)).filter(|&i| i > 0).map(|i| {
+                if p[..i].iter().any(|&b| crate::os::is_sep(b)) { &p[..i] } else { &p[..=i] }
+            });
+            if path == Some(p) {
+                break;
+            }
         }
         tree.top = kept.top;
         tree

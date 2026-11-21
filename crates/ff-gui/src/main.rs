@@ -1,33 +1,51 @@
 //! ff-gui: a search-as-you-type window over the ff index.
 
+// On Windows, a window program: no console window opens with it.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+mod app_icon;
 mod backend;
 mod canvas;
 mod complete;
 mod debug;
 mod dialog;
+#[cfg(windows)]
+mod gdi_text;
 mod i18n;
+mod keys;
 mod saved;
 mod settings;
 mod tree;
+#[cfg(not(windows))]
 mod wayland;
+#[cfg(windows)]
+mod win32;
+#[cfg(windows)]
+mod win_tray;
+#[cfg(windows)]
+mod winsys;
+#[cfg(not(windows))]
 mod x11;
+#[cfg(not(windows))]
 mod x11_backend;
+#[cfg(not(windows))]
 mod xkb;
 
 use std::io;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
-use canvas::{Canvas, Icon, Icons, ON_ACCENT, Text};
+use canvas::{Canvas, Icon, Icons, ON_ACCENT, Text, palette};
 use ff_core::{BuildOptions, CaseMode, Index, Kind, Query, SearchOptions, Sort, desktop, group_digits};
 use dialog::{Dialog, NavItem, Row};
 use i18n::{tr, trf};
 use settings::Config;
 use backend::{Backend, Cursor, Event, Key, Mods, Win, WindowSpec};
-use x11::*;
+use keys::*;
 
 const USAGE: &str = "\
 Fast search (ff-gui) - instant file search window
@@ -37,6 +55,8 @@ USAGE:
   ff-gui --install     add Fast search to the applications menu, with its icon
   ff-gui --shortcut on|off|KEYS   make a global shortcut open Fast search
                        (GNOME): Alt+E, or the KEYS you give, e.g. Ctrl+Alt+F
+  ff-gui --hidden      (Windows) start in the notification area, no window:
+                       how it starts at sign-in
 
 KEYS:
   type               search as you type (same term syntax as `ff`)
@@ -72,6 +92,7 @@ KEYS:
   Ctrl+R, Ctrl+B     regular expressions / whole words only
   F5                 rebuild the index (not needed while ffd runs)
   F6                 folder sizes: a tree and a map of what takes the space
+  F7                 show or hide that map
                      (arrows and Enter open folders, Esc goes back)
   click a column     sort by it (again to reverse)
   Esc                clear the search box, or quit when it is empty
@@ -81,21 +102,28 @@ ENVIRONMENT:
   FF_GUI_FONT        font file to use (default: the system sans-serif)
   FF_GUI_DEBUG       file to append drag-and-drop diagnostics to
   FF_GUI_TITLEBAR    set to system to use the desktop title bar
-                     instead of the built-in one (which shows the icon)
+                     instead of the built-in one (the menu bar, with the
+                     icon and the window buttons)
 ";
 
 /// Text height in pixels at 100% scale.
 const FONT_PX: f32 = 14.5;
 /// Side of the resize grip in the bottom-right corner, in layout units.
 const GRIP: i32 = 16;
+/// The main window's title (on Windows also how a second start finds it).
+const WINDOW_TITLE: &str = "Fast search";
+/// Width of each window button (minimize, maximize, close) in our title
+/// bar, in layout units, as Windows draws them.
+const TITLE_BUTTON: i32 = 46;
 
-const WHITE: u32 = 0xffffff;
-const PANEL: u32 = 0xf2f2f2;
-const LINE: u32 = 0xd0d0d0;
-const TEXT: u32 = 0x1f1f1f;
-const DIM: u32 = 0x666666;
-const SELECT: u32 = 0x1a66c9;
-const HOVER: u32 = 0xdbe9fa;
+// The Windows 11 (Fluent) palette, light values; see `canvas::palette`.
+const WHITE: u32 = palette::FIELD;
+const PANEL: u32 = palette::BASE;
+const LINE: u32 = palette::STROKE;
+const TEXT: u32 = palette::INK;
+const DIM: u32 = palette::DIM_INK;
+const SELECT: u32 = canvas::ACCENT;
+const HOVER: u32 = palette::HOVER;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Action {
@@ -124,6 +152,11 @@ enum Action {
     Toggle(Flag),
     /// Colours: 0 follow the desktop, 1 light, 2 dark.
     Theme(u8),
+    /// Start at sign-in, in the notification area (Windows).
+    #[cfg(windows)]
+    ToggleAutostart,
+    /// 0: the desktop's accent colour; n: canvas::ACCENTS[n - 1].
+    Accent(u8),
     /// 0 follow the system, 1 English, 2 French, 3 Spanish, 4 Italian.
     Language(u8),
     /// How sizes are written: 0 automatic, 1 bytes, 2 KB, 3 MB.
@@ -167,6 +200,8 @@ enum Action {
     ExportCsv,
     ConfirmExport,
     About,
+    /// Install the newest release, if there is one.
+    Update,
     Quit,
     ZoomIn,
     ZoomOut,
@@ -177,6 +212,20 @@ enum Action {
     SetShortcut,
     ToggleLauncher,
     ToggleDaemon,
+}
+
+/// An index being built on another thread.
+struct Building {
+    /// The new index (already saved), or why there is none.
+    rx: mpsc::Receiver<Result<Index, String>>,
+    /// Entries found so far.
+    found: Arc<AtomicUsize>,
+    started: Instant,
+    /// Entries expected (the last index's), 0 if unknown.
+    expected: usize,
+    /// Paths removed from the window meanwhile: the walk may have seen
+    /// them before they went, so they are checked again at the end.
+    forgotten: Vec<PathBuf>,
 }
 
 /// An on/off option, in the order of `FLAGS`.
@@ -193,10 +242,14 @@ enum Flag {
     SelectedInStatus,
     WildcardWholeName,
     MatchPath,
+    /// Closing hides the window to the notification area (Windows).
+    CloseToTray,
+    /// The map of the selected folder beside the folder sizes tree.
+    SizeMap,
 }
 
 /// Each option's name in the settings file and its default.
-const FLAGS: [(&str, bool); 11] = [
+const FLAGS: [(&str, bool); 13] = [
     ("hide_results_when_empty", false),
     ("close_on_open", false),
     ("path_double_click", true),
@@ -208,6 +261,8 @@ const FLAGS: [(&str, bool); 11] = [
     ("selected_in_status_bar", false),
     ("wildcards_whole_name", true),
     ("match_path", false),
+    ("close_to_tray", true),
+    ("show_size_map", true),
 ];
 
 /// Menu entries: label, shortcut hint, action.
@@ -237,7 +292,7 @@ const TEXT_CONTEXT_MENU: Items = &[
 ];
 
 /// The menu bar.
-const BAR: [(&str, Items); 6] = [
+const BAR: [(&str, Items); 7] = [
     (
         "File",
         &[
@@ -276,8 +331,11 @@ const BAR: [(&str, Items); 6] = [
             ("Regular expressions", "Ctrl+R", Action::ToggleRegex),
             ("Whole words only", "Ctrl+B", Action::ToggleWord),
             ("Folder sizes", "F6", Action::TreeSize),
+            ("Size map", "F7", Action::Toggle(Flag::SizeMap)),
         ],
     ),
+    // Filled in from canvas::THEMES when it opens.
+    ("Theme", &[]),
     // Filled in from the saved bookmarks when it opens.
     ("Bookmarks", &[]),
     (
@@ -288,7 +346,7 @@ const BAR: [(&str, Items); 6] = [
             ("Zoom in", "Ctrl++", Action::ZoomIn),
             ("Zoom out", "Ctrl+-", Action::ZoomOut),
             ("Reset zoom", "Ctrl+0", Action::ZoomReset),
-            ("Title bar with icon", "", Action::ToggleTitleBar),
+            ("Menus in the title bar", "", Action::ToggleTitleBar),
             ("Global shortcut", "", Action::ToggleShortcut),
             ("Show in applications menu", "", Action::ToggleLauncher),
             ("Live updates service", "asks for password", Action::ToggleDaemon),
@@ -300,10 +358,37 @@ const BAR: [(&str, Items); 6] = [
             ("Search syntax", "F1", Action::Help(0)),
             ("Filters", "", Action::Help(1)),
             ("Keyboard shortcuts", "", Action::Help(2)),
+            ("Check for updates", "", Action::Update),
             ("About Fast search", "", Action::About),
         ],
     ),
 ];
+
+/// "System" (follow the desktop) and every theme of `canvas::THEMES`, as
+/// menu entries and preferences rows: built once.
+fn theme_choices() -> Items {
+    static CHOICES: std::sync::OnceLock<Vec<(&'static str, &'static str, Action)>> = std::sync::OnceLock::new();
+    CHOICES.get_or_init(|| {
+        let themes = canvas::THEMES.iter().enumerate().map(|(i, t)| (t.name, "", Action::Theme(i as u8 + 1)));
+        std::iter::once(("System", "", Action::Theme(0))).chain(themes).collect()
+    })
+}
+
+/// The desktop's accent colour and every one of `canvas::ACCENTS`, as
+/// menu entries: built once.
+fn accent_choices() -> Items {
+    static CHOICES: std::sync::OnceLock<Vec<(&'static str, &'static str, Action)>> = std::sync::OnceLock::new();
+    CHOICES.get_or_init(|| {
+        let accents = canvas::ACCENTS.iter().enumerate().map(|(i, a)| (a.0, "", Action::Accent(i as u8 + 1)));
+        std::iter::once(("System accent", "", Action::Accent(0))).chain(accents).collect()
+    })
+}
+
+/// The Theme menu: the themes, then the accent colours.
+fn theme_menu() -> Items {
+    static MENU: std::sync::OnceLock<Vec<(&'static str, &'static str, Action)>> = std::sync::OnceLock::new();
+    MENU.get_or_init(|| theme_choices().iter().chain(accent_choices()).copied().collect())
+}
 
 /// An open menu: a result's right-click menu or one from the menu bar.
 struct Menu {
@@ -400,6 +485,7 @@ struct App {
     flags: [bool; FLAGS.len()],
     size_format: u8,
     theme: u8,
+    accent: u8,
     language: u8,
     /// Row under the pointer, for the mouseover highlight.
     hover_row: Option<usize>,
@@ -418,6 +504,8 @@ struct App {
     options_page: Option<u8>,
     /// Options for the next rebuild, when they differ from the last one's.
     pending_build: Option<BuildOptions>,
+    /// An index being built in the background, shown with its progress.
+    building: Option<Building>,
     /// The drives as shown (and edited) on the Drives screen.
     drives: Vec<settings::Drive>,
     drive_selected: usize,
@@ -443,7 +531,17 @@ struct App {
 }
 
 fn main() -> ExitCode {
+    // A window program has no console of its own: write to the one it
+    // was started from, if any, and show fatal errors in a message box.
+    #[cfg(windows)]
+    winsys::attach_console();
+    run()
+}
+
+fn run() -> ExitCode {
     let mut db = None;
+    // Started at sign-in: to the notification area, no window.
+    let mut hidden = false;
     let mut query = Vec::new();
     let mut args = std::env::args();
     args.next();
@@ -454,9 +552,21 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "-V" | "--version" => {
-                println!("ff-gui {}", env!("CARGO_PKG_VERSION"));
+                println!("ff-gui {}", ff_core::update::VERSION);
                 return ExitCode::SUCCESS;
             }
+            // For packaging: the icon as an .ico file (the Windows installer uses it).
+            "--write-icon" => {
+                let Some(file) = args.next() else { return ExitCode::from(2) };
+                return match std::fs::write(&file, app_icon::ico()) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("ff-gui: {file}: {e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            "--hidden" => hidden = true,
             "--db" => db = args.next().map(PathBuf::from),
             "--shortcut" => {
                 // "on" uses the keys chosen before (Alt+E at first).
@@ -494,12 +604,14 @@ fn main() -> ExitCode {
                     }
                 };
             }
+            #[cfg(not(windows))]
             "--hold-wayland-clipboard" => {
                 return match wayland::hold_clipboard() {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(_) => ExitCode::FAILURE,
                 };
             }
+            #[cfg(not(windows))]
             "--hold-clipboard" => {
                 return match x11_backend::hold_clipboard(args.next().as_deref() == Some("file")) {
                     Ok(()) => ExitCode::SUCCESS,
@@ -521,6 +633,19 @@ fn main() -> ExitCode {
             _ => query.push(a),
         }
     }
+    // Already running (perhaps hidden in the notification area): show that
+    // window, which has the index loaded, instead of starting again; a
+    // hidden start (at sign-in) then has nothing to do. Test runs, which
+    // draw one frame and exit, always start their own.
+    #[cfg(windows)]
+    if std::env::var_os("FF_GUI_SNAPSHOT").is_none() && std::env::var_os("FF_GUI_TEST").is_none() {
+        if hidden && win_tray::running(WINDOW_TITLE) {
+            return ExitCode::SUCCESS;
+        }
+        if !hidden && win_tray::wake_running(WINDOW_TITLE) {
+            return ExitCode::SUCCESS;
+        }
+    }
     let follow_default = db.is_none();
     let Some(db) = db.or_else(ff_core::default_db_path) else {
         eprintln!("ff-gui: HOME is not set; use --db");
@@ -528,10 +653,12 @@ fn main() -> ExitCode {
     };
     // Mends a shortcut saved wrongly by an earlier version, out of the way.
     std::thread::spawn(settings::repair_shortcut);
-    match App::new(db, follow_default, query.join(" ")).and_then(|mut app| app.run()) {
+    match App::new(db, follow_default, query.join(" "), hidden).and_then(|mut app| app.run()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("ff-gui: {e}");
+            #[cfg(windows)]
+            winsys::error_box(&format!("ff-gui: {e}"));
             ExitCode::FAILURE
         }
     }
@@ -540,6 +667,7 @@ fn main() -> ExitCode {
 /// Asks the kernel whether we may use a file in a way (`mode`: 4 read,
 /// 2 write, 1 search). `None` if that could not be told, for instance
 /// because the file is gone: the action itself then reports it.
+#[cfg(unix)]
 fn access(path: &std::path::Path, mode: i32) -> Option<bool> {
     use std::os::unix::ffi::OsStrExt;
     unsafe extern "C" {
@@ -557,14 +685,31 @@ fn access(path: &std::path::Path, mode: i32) -> Option<bool> {
 }
 
 /// False if we may not open the file, or list the folder.
+#[cfg(unix)]
 fn may_read(path: &std::path::Path) -> bool {
     let mode = if path.is_dir() { 4 | 1 } else { 4 };
     access(path, mode) != Some(false)
 }
 
+/// On Windows access is decided by access control lists, which only an
+/// attempt tells reliably: a folder that refuses to be listed says no.
+#[cfg(windows)]
+fn may_read(path: &std::path::Path) -> bool {
+    let denied = |r: io::Result<()>| r.is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied);
+    if path.is_dir() { !denied(std::fs::read_dir(path).map(drop)) } else { !denied(std::fs::File::open(path).map(drop)) }
+}
+
+/// On Windows: anything but a drive's root; a refusal shows when the
+/// action is tried.
+#[cfg(windows)]
+fn may_delete(path: &std::path::Path) -> bool {
+    path.parent().is_some()
+}
+
 /// False if we may not remove the file from its folder (to delete it,
 /// trash it or move it). That is decided by the folder, not the file;
 /// in a "sticky" folder such as /tmp only the owner may.
+#[cfg(unix)]
 fn may_delete(path: &std::path::Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     let Some(folder) = path.parent() else { return false }; // the root itself
@@ -579,6 +724,16 @@ fn may_delete(path: &std::path::Path) -> bool {
     let (Ok(inside), Ok(holder)) = (path.symlink_metadata(), folder.metadata()) else { return true };
     let me = std::fs::metadata("/proc/self").map_or(holder.uid(), |m| m.uid());
     holder.mode() & 0o1000 == 0 || me == 0 || me == inside.uid() || me == holder.uid()
+}
+
+/// A typed folder without trailing separators, except where one is part
+/// of a root (`/`, `C:\`).
+fn trim_folder(typed: &str) -> String {
+    let trimmed = typed.trim_end_matches(['/', std::path::MAIN_SEPARATOR]);
+    if trimmed.is_empty() || trimmed.ends_with(':') {
+        return typed.to_string();
+    }
+    trimmed.to_string()
 }
 
 fn debug(msg: impl AsRef<str>) {
@@ -597,19 +752,19 @@ struct DragArm {
 /// What a drag is called in messages: a file name, or "5 items".
 fn drag_label(paths: &str) -> String {
     match paths.lines().count() {
-        1 => paths.rsplit('/').next().unwrap_or(paths).to_string(),
+        1 => paths.rsplit(['/', std::path::MAIN_SEPARATOR]).next().unwrap_or(paths).to_string(),
         n => trf("{} items", &[&n]),
     }
 }
 
 impl App {
-    fn new(db: PathBuf, follow_default: bool, query: String) -> io::Result<App> {
+    fn new(db: PathBuf, follow_default: bool, query: String, hidden: bool) -> io::Result<App> {
         let config = Config::load();
         let (notice_tx, notices) = mpsc::channel();
         // FF_GUI_SCALE beats the saved zoom, which beats the desktop scale.
         let env_scale = std::env::var("FF_GUI_SCALE").ok().and_then(|v| v.parse::<f32>().ok());
         let fixed = env_scale.or(config.scale).map(|s| s.clamp(0.5, 8.0));
-        let mut b = backend::connect(&WindowSpec { title: "Fast search", width: 1000, height: 640, scale: fixed })?;
+        let mut b = backend::connect(&WindowSpec { title: WINDOW_TITLE, width: 1000, height: 640, scale: fixed, hidden })?;
         let auto_scale = if env_scale.is_some() { env_scale.unwrap() } else { b.scale() };
         debug(format!("display: {} at scale {auto_scale}", b.name()));
         let scale = fixed.unwrap_or(auto_scale);
@@ -677,7 +832,8 @@ impl App {
             dialog: None,
             flags: FLAGS.map(|(key, default)| config.more.get(key).map_or(default, |v| v == "on")),
             size_format: config.more.get("size_format").and_then(|v| v.parse().ok()).filter(|f| *f < 4).unwrap_or(2),
-            theme: config.more.get("theme").and_then(|v| v.parse().ok()).filter(|t| *t < 3).unwrap_or(0),
+            theme: config.more.get("theme").and_then(|v| v.parse().ok()).filter(|&t: &u8| (t as usize) <= canvas::THEMES.len()).unwrap_or(0),
+            accent: config.more.get("accent").and_then(|v| v.parse().ok()).filter(|&a: &u8| (a as usize) <= canvas::ACCENTS.len()).unwrap_or(0),
             language: config.more.get("language").and_then(|v| v.parse().ok()).filter(|l| *l < 5).unwrap_or(0),
             hover_row: None,
             dialog_input: String::new(),
@@ -689,6 +845,7 @@ impl App {
             options_page: None,
             drives: Vec::new(),
             pending_build: None,
+            building: None,
             tree: None,
             tiles: Vec::new(),
             tile_hover: None,
@@ -719,6 +876,11 @@ impl App {
     fn event_loop(&mut self) -> io::Result<()> {
         if self.index.is_empty() {
             self.reindex()?; // first start: no index yet
+            // The test hooks below look at the first frame: give them the
+            // finished index, not its progress.
+            if std::env::var_os("FF_GUI_TEST").is_some() || std::env::var_os("FF_GUI_SNAPSHOT").is_some() {
+                self.finish_build(true);
+            }
         }
         self.search();
         // Test hooks: open a panel, save the first frame, exit.
@@ -731,6 +893,7 @@ impl App {
                 self.open_bar_menu(2);
                 self.menu.as_mut().unwrap().hover = Some(1);
             }
+            Ok("themes") => self.open_bar_menu(3),
             Ok("about") => self.about = true,
             // Copy as a real key press would, then quit: the copy must survive.
             Ok("copy") => self.act(Action::CopyFile, 123_456_789),
@@ -752,6 +915,9 @@ impl App {
             Ok("options3") => self.act(Action::Options(3), 0),
             Ok("options4") => self.act(Action::Options(4), 0),
             Ok("options8") => self.act(Action::Options(8), 0),
+            Ok("options9") => self.act(Action::Options(9), 0),
+            Ok("options5") => self.act(Action::Options(5), 0),
+            Ok("options7") => self.act(Action::Options(7), 0),
             Ok("bookmark1") => self.act(Action::Bookmark(0), 0),
             Ok("drives") => self.act(Action::Options(6), 0),
             Ok("apply-preview") => {
@@ -831,10 +997,13 @@ impl App {
                 self.act(Action::CopyFile, 123_456_789);
                 return Ok(());
             }
-            Ok("reindex") => self.reindex()?,
+            Ok("reindex") => {
+                self.reindex()?;
+                self.finish_build(true);
+            }
             Ok("tree") => self.toggle_tree(),
             Ok("complete") => self.update_completion(),
-            Ok("bookmarks") => self.open_bar_menu(3),
+            Ok("bookmarks") => self.open_bar_menu(4),
             Ok("bookmark-add") => self.act(Action::AddBookmark, 0),
             Ok("export") => self.act(Action::ExportCsv, 0),
             Ok("export-now") => {
@@ -843,7 +1012,7 @@ impl App {
                 eprintln!("{}", self.status);
                 return Ok(());
             }
-            Ok("options") => self.open_bar_menu(4),
+            Ok("options") => self.open_bar_menu(5),
             Ok("props") => self.act(Action::Properties, 0),
             Ok("select") => self.anchor = self.step(self.cursor, false, true),
             _ => {}
@@ -875,10 +1044,17 @@ impl App {
             }
             // Redraw only once the event queue is drained.
             // While idle, wake once a second to notice a refreshed index.
-            let wait = if dirty { Duration::ZERO } else { Duration::from_secs(1) };
+            // While indexing, wake often to move the progress along.
+            let idle = if self.building.is_some() { Duration::from_millis(150) } else { Duration::from_secs(1) };
+            let wait = if dirty { Duration::ZERO } else { idle };
             let Some(event) = self.b.next_event(Some(wait))? else {
                 if !dirty {
-                    dirty = self.reload_if_changed();
+                    dirty = if self.building.is_some() {
+                        self.finish_build(false);
+                        true
+                    } else {
+                        self.reload_if_changed()
+                    };
                     continue;
                 }
                 self.render()?;
@@ -931,7 +1107,18 @@ impl App {
                         dirty = true;
                     }
                 }
-                Event::Close(_) => return Ok(()),
+                Event::Close(_) => {
+                    if !self.dismiss() {
+                        return Ok(());
+                    }
+                }
+                Event::Quit => return Ok(()),
+                // Back from the notification area: typing replaces the
+                // last search.
+                Event::Shown => {
+                    self.act(Action::SelectAll, 0);
+                    dirty = true;
+                }
                 Event::Key { key, mods, .. } => {
                     if !self.key(key, mods)? {
                         return Ok(());
@@ -1163,24 +1350,77 @@ impl App {
             self.status = tr("The index is kept up to date by the ffd daemon").into();
             return Ok(());
         }
-        self.status = tr("Indexing...").into();
-        self.render()?;
+        if self.building.is_some() {
+            return Ok(()); // already under way: its progress is showing
+        }
+        // The walk runs in the background; the window stays usable with
+        // the old index and shows how far the new one has got.
         let opts = self.pending_build.take().unwrap_or_else(|| BuildOptions::refresh(&self.index));
-        match Index::build(&opts) {
-            Ok(index) => {
-                self.status = match index.save(&self.db) {
-                    Ok(()) => String::new(),
-                    Err(e) => format!("could not save the index: {e}"),
-                };
+        let found = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel();
+        let (db, counter) = (self.db.clone(), found.clone());
+        std::thread::spawn(move || {
+            let result = Index::build_with_progress(&opts, &counter).map_err(|e| format!("indexing failed: {e}")).and_then(|index| {
+                index.save(&db).map_err(|e| format!("could not save the index: {e}"))?;
+                Ok(index)
+            });
+            let _ = tx.send(result);
+        });
+        // The last index's size is a good guess at the new one's.
+        self.building = Some(Building { rx, found, started: Instant::now(), expected: self.index.len(), forgotten: Vec::new() });
+        self.status.clear();
+        Ok(())
+    }
+
+    /// Takes the finished index, if the background build is done
+    /// (`wait`: block until it is).
+    fn finish_build(&mut self, wait: bool) {
+        let Some(build) = &self.building else { return };
+        let result = if wait {
+            build.rx.recv().map_err(|_| ())
+        } else {
+            match build.rx.try_recv() {
+                Ok(result) => Ok(result),
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => Err(()),
+            }
+        };
+        let took = build.started.elapsed();
+        let forgotten = self.building.take().map(|b| b.forgotten).unwrap_or_default();
+        match result {
+            Ok(Ok(index)) => {
                 self.db_stamp = std::fs::metadata(&self.db).and_then(|m| m.modified()).ok();
                 let kept = self.keep_tree();
                 self.index = index;
                 self.restore_tree(kept);
+                self.status = trf("Indexed {} entries in {} s", &[&group_digits(self.index.len() as u64), &format!("{:.1}", took.as_secs_f64())]);
+                if !forgotten.is_empty() {
+                    self.forget(&forgotten);
+                }
             }
-            Err(e) => self.status = format!("indexing failed: {e}"),
+            Ok(Err(e)) => self.status = e,
+            Err(()) => self.status = tr("indexing failed").into(),
         }
         self.search();
-        Ok(())
+        // Options changed while this build ran: build again with them.
+        if self.pending_build.is_some() {
+            let _ = self.reindex();
+        }
+    }
+
+    /// The status bar text while indexing: entries found, an estimate of
+    /// how far along that is, and the time taken.
+    fn build_status(&self) -> Option<(String, Option<f64>)> {
+        let build = self.building.as_ref()?;
+        let found = build.found.load(Ordering::Relaxed);
+        let secs = build.started.elapsed().as_secs();
+        let share = (build.expected > 0).then(|| (found as f64 / build.expected as f64).min(0.99));
+        let count = trf("Indexing... {} entries", &[&group_digits(found as u64)]);
+        let text = match share {
+            Some(share) => format!("{count}  ·  {:.0} %  ·  {secs} s", share * 100.0),
+            None => format!("{count}  ·  {secs} s"),
+        };
+        Some((text, share))
     }
 
     /// Runs a menu or keyboard action.
@@ -1269,6 +1509,11 @@ impl App {
                 self.apply_theme();
                 return self.save_config();
             }
+            Action::Accent(accent) => {
+                self.accent = accent;
+                self.apply_theme();
+                return self.save_config();
+            }
             Action::ToggleRegex => {
                 self.regex = !self.regex;
                 self.save_config();
@@ -1311,7 +1556,7 @@ impl App {
                 // From the text field, or the folder selected in the results
                 // (the folder holding it, if a file is selected).
                 let folder = if action == Action::AddExclude {
-                    std::mem::take(&mut self.dialog_input).trim().trim_end_matches('/').to_string()
+                    trim_folder(std::mem::take(&mut self.dialog_input).trim())
                 } else {
                     let Some(&id) = self.hits.get(self.sel) else {
                         self.status = tr("Select a folder in the results first").into();
@@ -1320,7 +1565,7 @@ impl App {
                     let folder = if self.index.is_dir(id) { Some(id) } else { self.index.parent(id) };
                     folder.map(|f| self.index.path(f).to_string_lossy().into_owned()).unwrap_or_default()
                 };
-                if !folder.starts_with('/') {
+                if !std::path::Path::new(&folder).is_absolute() {
                     self.status = tr("A folder to exclude must be a full path, like /home/me/Videos").into();
                 } else if !self.excludes.contains(&folder) {
                     self.exclude_selected = self.excludes.len();
@@ -1454,6 +1699,16 @@ impl App {
                 }
                 return;
             }
+            #[cfg(windows)]
+            Action::ToggleAutostart => {
+                let on = !settings::autostart_enabled();
+                self.status = match settings::set_autostart(on) {
+                    Ok(()) if on => "Fast search starts at sign-in, in the notification area".into(),
+                    Ok(()) => "Fast search no longer starts at sign-in".into(),
+                    Err(e) => format!("could not change the start at sign-in: {e}"),
+                };
+                return;
+            }
             Action::ToggleLauncher => {
                 let done = if settings::launcher_installed() { settings::remove_launcher() } else { settings::install_launcher().map(drop) };
                 self.status = match done {
@@ -1467,6 +1722,23 @@ impl App {
                 self.status = tr("Waiting for authorization...").into();
                 let (install, tx) = (!settings::daemon_installed(), self.notice_tx.clone());
                 std::thread::spawn(move || tx.send(settings::set_daemon(install)));
+                return;
+            }
+            Action::Update => {
+                self.status = tr("Checking for updates...").into();
+                let tx = self.notice_tx.clone();
+                std::thread::spawn(move || {
+                    // On Windows the installer replaces this program and
+                    // starts it again; elsewhere packages do the updating.
+                    #[cfg(windows)]
+                    let done = ff_core::update::update(true, |step| drop(tx.send(step.to_string())));
+                    #[cfg(not(windows))]
+                    let done = ff_core::update::latest().map(|r| match r.is_newer() {
+                        true => format!("Fast search {} is available: {}", r.version(), r.page()),
+                        false => format!("Fast search is up to date ({})", ff_core::update::VERSION),
+                    });
+                    tx.send(done.unwrap_or_else(|e| format!("Could not update: {e}")))
+                });
                 return;
             }
             _ => {}
@@ -1483,9 +1755,9 @@ impl App {
                 self.status = format!("{} results selected: open at most 20 at a time", paths.len());
             }
             Action::Open if self.flag(Flag::CloseOnOpen) => {
-                // Open first, then close: nothing is left running to do it later.
+                // Open first, then close (or hide to the notification area).
                 paths.iter().for_each(|p| drop(desktop::open(p)));
-                self.quit = true;
+                self.quit = !self.dismiss();
             }
             Action::Open => {
                 self.status = if many { trf("Opening {} items", &[&paths.len()]) } else { trf("Opening {}", &[&path.display()]) };
@@ -1565,12 +1837,13 @@ impl App {
     /// the chosen page on the right. Changes apply as they are made,
     /// except drive settings, which have their own Apply button.
     fn open_options(&mut self, page: u8) -> io::Result<()> {
-        let page = page.min(8);
+        let page = page.min(9);
         self.refresh_option_states();
         self.load_index_settings();
         let nav = vec![
             NavItem { label: "General", child: false, action: Action::Options(0) },
             NavItem { label: "Interface", child: true, action: Action::Options(0) },
+            NavItem { label: "Language", child: true, action: Action::Options(9) },
             NavItem { label: "Search", child: true, action: Action::Options(1) },
             NavItem { label: "Results", child: true, action: Action::Options(2) },
             NavItem { label: "View", child: true, action: Action::Options(3) },
@@ -1581,12 +1854,12 @@ impl App {
             NavItem { label: "Drives", child: true, action: Action::Options(6) },
             NavItem { label: "Exclude", child: true, action: Action::Options(7) },
         ];
-        let selected = [1, 2, 3, 4, 5, 8, 9, 10, 6][page as usize];
+        let selected = [1, 3, 4, 5, 6, 9, 10, 11, 7, 2][page as usize];
         let (heading, rows) = match page {
             0 => (
                 "Interface",
-                vec![
-                    Row::Check("Title bar with the application icon", Action::ToggleTitleBar),
+                [
+                    Row::Check("Menus in the title bar, with the application icon", Action::ToggleTitleBar),
                     Row::Gap,
                     Row::Pair("Zoom", format!("{:.0}%", self.scale * 100.0)),
                     Row::Button("Zoom in", Action::ZoomIn),
@@ -1594,11 +1867,14 @@ impl App {
                     Row::Button("Reset to the desktop scale", Action::ZoomReset),
                     Row::Gap,
                     Row::Dim("Theme".into()),
-                    Row::Check("Follow the desktop", Action::Theme(0)),
-                    Row::Check("Light", Action::Theme(1)),
-                    Row::Check("Dark", Action::Theme(2)),
-                    Row::Gap,
-                    Row::Dim("Language".into()),
+                ]
+                .into_iter()
+                .chain(theme_choices().iter().map(|&(label, _, action)| Row::Check(label, action)))
+                .collect(),
+            ),
+            9 => (
+                "Language",
+                vec![
                     Row::Check("Follow the system", Action::Language(0)),
                     Row::Check("English", Action::Language(1)),
                     Row::Check("Français", Action::Language(2)),
@@ -1645,6 +1921,7 @@ impl App {
                     Row::Check("Alternate row color", Action::Toggle(Flag::AltRows)),
                     Row::Check("Show row mouseover", Action::Toggle(Flag::RowHover)),
                     Row::Check("Show selected item in status bar", Action::Toggle(Flag::SelectedInStatus)),
+                    Row::Check("Show the size map beside the folder sizes", Action::Toggle(Flag::SizeMap)),
                     Row::Gap,
                     Row::Dim("Size format".into()),
                     Row::Check("Auto (B, KB, MB, GB)", Action::SizeFormat(0)),
@@ -1663,6 +1940,10 @@ impl App {
                     // What came of the last change, or why it was refused.
                     Row::Dim(self.status.clone()),
                     Row::Check("Show in the applications menu", Action::ToggleLauncher),
+                    #[cfg(windows)]
+                    Row::Check("Closing the window keeps it in the notification area", Action::Toggle(Flag::CloseToTray)),
+                    #[cfg(windows)]
+                    Row::Check("Start at sign-in, in the notification area", Action::ToggleAutostart),
                 ],
             ),
             5 => (
@@ -1816,6 +2097,7 @@ impl App {
                     pair("Ctrl+S", "export the results as a CSV file"),
                     pair("F5", "rebuild the index"),
                     pair("F6", "folder sizes: what takes the space"),
+                    pair("F7", "show or hide the size map beside the folder sizes"),
                     pair("Ctrl +, Ctrl -, Ctrl 0", "zoom in, out, reset"),
                     pair("Esc", "clear the search box; quit when it is empty"),
                 ],
@@ -1846,10 +2128,12 @@ impl App {
     /// Makes the results reflect that `paths` were just removed, without
     /// waiting for the next index refresh.
     fn forget(&mut self, paths: &[PathBuf]) {
-        use std::os::unix::ffi::OsStrExt;
+        if let Some(build) = &mut self.building {
+            build.forgotten.extend_from_slice(paths);
+        }
         let changes: std::collections::HashSet<_> = paths
             .iter()
-            .filter_map(|p| Some((p.parent()?.as_os_str().as_bytes().to_vec(), p.file_name()?.as_bytes().to_vec())))
+            .filter_map(|p| Some((ff_core::os::path_bytes(p.parent()?).to_vec(), ff_core::os::bytes(p.file_name()?).to_vec())))
             .collect();
         // Checks the disk: an entry only goes if the file really is gone.
         let kept = self.keep_tree();
@@ -1874,12 +2158,30 @@ impl App {
     /// Switches the palette to the chosen theme; "follow the desktop"
     /// asks the desktop whether it prefers dark.
     fn apply_theme(&mut self) {
-        let dark = match self.theme {
-            1 => false,
-            2 => true,
-            _ => settings::desktop_prefers_dark(),
+        // FF_GUI_THEME=<first word of a theme's name> pins it, for test
+        // pictures: light, dark, graphite, ...
+        let pinned = std::env::var("FF_GUI_THEME").ok().and_then(|t| {
+            canvas::THEMES.iter().position(|th| th.name.split(' ').next().unwrap_or("").eq_ignore_ascii_case(&t))
+        });
+        // Theme 0 follows the desktop (Light or Dark); n is THEMES[n - 1].
+        let index = match pinned {
+            Some(i) => i,
+            None if self.theme == 0 => settings::desktop_prefers_dark() as usize,
+            None => self.theme as usize - 1,
         };
-        canvas::set_dark(dark);
+        canvas::set_theme(index);
+        // A colour chosen here, else the desktop's: on Windows the accent
+        // colour of its personalization settings (stored as 0xAABBGGRR),
+        // elsewhere the first of the list.
+        if let Some(&(_, rgb)) = (self.accent as usize).checked_sub(1).and_then(|i| canvas::ACCENTS.get(i)) {
+            canvas::set_accent(rgb);
+            return;
+        }
+        canvas::set_accent(canvas::ACCENTS[0].1);
+        #[cfg(windows)]
+        if let Some(abgr) = winsys::reg_dword(winsys::HKEY_CURRENT_USER, r"Software\Microsoft\Windows\DWM", "AccentColor") {
+            canvas::set_accent((abgr & 0xff) << 16 | (abgr & 0xff00) | (abgr >> 16 & 0xff));
+        }
     }
 
     /// The line on the index pages saying how their changes are saved.
@@ -1943,6 +2245,7 @@ impl App {
             Action::Toggle(flag) => self.flag(flag),
             Action::SizeFormat(format) => format == self.size_format,
             Action::Theme(theme) => theme == self.theme,
+            Action::Accent(accent) => accent == self.accent,
             Action::Language(language) => language == self.language,
             Action::SelectExclude(i) => i as usize == self.exclude_selected,
             Action::SelectBookmark(i) => i as usize == self.bookmark_selected,
@@ -1955,6 +2258,8 @@ impl App {
             Action::TreeSize => self.tree.is_some(),
             Action::Case(case) => case == self.case,
             Action::ToggleTitleBar => self.custom_title,
+            #[cfg(windows)]
+            Action::ToggleAutostart => settings::autostart_enabled(),
             Action::ToggleShortcut => self.shortcut_on,
             Action::ToggleLauncher => self.launcher_on,
             Action::ToggleDaemon => self.daemon_on,
@@ -1975,6 +2280,7 @@ impl App {
             FLAGS.iter().zip(self.flags).map(|((key, _), on)| (key.to_string(), if on { "on" } else { "off" }.to_string())).collect();
         more.insert("size_format".into(), self.size_format.to_string());
         more.insert("theme".into(), self.theme.to_string());
+        more.insert("accent".into(), self.accent.to_string());
         more.insert("language".into(), self.language.to_string());
         more.insert("shortcut".into(), self.shortcut_keys.clone());
         let config = Config { scale, own_title_bar: self.custom_title, regex: self.regex, whole_word: self.whole_word, case, more };
@@ -2025,8 +2331,8 @@ impl App {
     // ---- our own title bar --------------------------------------------
 
     fn title_button_at(&self, x: i32, y: i32) -> Option<usize> {
-        let (w, bw) = (self.cv.w as i32, 44 * self.u);
-        (self.custom_title && y >= 0 && y < self.title_h() && x >= w - 3 * bw && x < w).then(|| ((x - (w - 3 * bw)) / bw) as usize)
+        let (w, bw) = (self.cv.w as i32, TITLE_BUTTON * self.u);
+        (self.custom_title && y >= 0 && y < self.menu_h() && x >= w - 3 * bw && x < w).then(|| ((x - (w - 3 * bw)) / bw) as usize)
     }
 
     /// Resize direction if (x, y) is on the window's edge.
@@ -2064,6 +2370,15 @@ impl App {
         }
     }
 
+    /// Closes the window as the user asked (its close button, Alt+F4, Esc
+    /// on an empty search): on Windows it hides to the notification area,
+    /// to come back at once with the shortcut. True if it did; else the
+    /// program should exit.
+    fn dismiss(&mut self) -> bool {
+        self.menu = None;
+        self.flag(Flag::CloseToTray) && self.b.hide_to_tray()
+    }
+
     /// A left press on the title bar or window edge; true if handled.
     fn press_frame(&mut self, x: i32, y: i32, time: u32) -> bool {
         if !self.custom_title {
@@ -2073,11 +2388,12 @@ impl App {
             match button {
                 0 => self.b.minimize(),
                 1 => self.b.toggle_maximize(),
-                _ => self.quit = true,
+                _ => self.quit = !self.dismiss(),
             }
         } else if let Some(edge) = self.resize_edge(x, y) {
             self.b.start_resize(edge);
-        } else if y < self.title_h() {
+        } else if y < self.menu_h() && self.bar_title_at(x, y).is_none() && self.bar_toggle_at(x, y).is_none() {
+            // The menu bar's empty space is the title bar: drag to move.
             if time.wrapping_sub(self.last_title_click) < 400 {
                 self.b.toggle_maximize();
             } else {
@@ -2090,20 +2406,19 @@ impl App {
         true
     }
 
+    /// Our title bar is the menu bar itself: the application icon at its
+    /// left, the window buttons at its right.
     fn draw_title_bar(&mut self) {
-        let (w, th, u) = (self.cv.w as i32, self.title_h(), self.u);
-        self.cv.fill(0, 0, w, th, 0xe6e6e6);
-        self.cv.fill(0, th - 1, w, 1, LINE);
+        let (w, th, u) = (self.cv.w as i32, self.menu_h(), self.u);
         let icon = self.icons.size as i32;
         self.icons.draw(&mut self.cv, 10 * u, (th - icon) / 2, Icon::App);
-        self.text.draw(&mut self.cv, 16 * u + icon, (th - self.text.height) / 2, "Fast search", w / 2, TEXT);
-        let bw = 44 * u;
+        let bw = TITLE_BUTTON * u;
         for button in 0..3 {
             let x = w - (3 - button) * bw;
             let hovered = self.hover_button == Some(button as usize);
-            let ink = if hovered && button == 2 { ON_ACCENT } else { 0x3a3a3a };
+            let ink = if hovered && button == 2 { ON_ACCENT } else { TEXT };
             if hovered {
-                self.cv.fill(x, 0, bw, th - 1, if button == 2 { 0xd93025 } else { 0xd2d2d2 });
+                self.cv.fill(x, 0, bw, th, if button == 2 { 0xc42b1c } else { HOVER });
             }
             // 10-unit glyphs centred in the button.
             let (gx, gy, g, t) = (x + (bw - 10 * u) / 2, (th - 10 * u) / 2, 10 * u, u.max(1));
@@ -2121,13 +2436,47 @@ impl App {
     }
 
     /// (x, width) of each menu-bar title.
-    fn bar_titles(&mut self) -> [(i32, i32); 6] {
-        let mut x = 4 * self.u;
+    fn bar_titles(&mut self) -> [(i32, i32); BAR.len()] {
+        // After the application icon when the menu bar is the title bar.
+        let mut x = if self.custom_title { 16 * self.u + self.icons.size as i32 } else { 4 * self.u };
         BAR.map(|(title, _)| {
             let w = self.text.width(tr(title)) + 18 * self.u;
             x += w;
             (x - w, w)
         })
+    }
+
+    /// Toggle buttons at the right end of the menu bar, as (x, width,
+    /// label, action): Folder sizes, and Size map while the sizes are
+    /// shown. Left out when the window is too narrow to fit them.
+    fn bar_toggles(&mut self) -> Vec<(i32, i32, &'static str, Action)> {
+        let mut buttons: Vec<(&'static str, Action)> = vec![("Folder sizes", Action::TreeSize)];
+        if self.tree.is_some() {
+            buttons.push(("Size map", Action::Toggle(Flag::SizeMap)));
+        }
+        let (u, titles_end) = (self.u, self.bar_titles().last().map_or(0, |&(x, w)| x + w));
+        // Left of the window buttons when the menu bar is the title bar.
+        let buttons_w = if self.custom_title { 3 * TITLE_BUTTON * u } else { 0 };
+        let mut x = self.cv.w as i32 - buttons_w - 6 * u;
+        let mut out = Vec::new();
+        for (label, action) in buttons.into_iter().rev() {
+            let w = self.text.width(tr(label)) + 20 * u;
+            x -= w;
+            out.push((x, w, label, action));
+            x -= 6 * u;
+        }
+        if x < titles_end + 12 * u {
+            return Vec::new();
+        }
+        out.reverse();
+        out
+    }
+
+    fn bar_toggle_at(&mut self, x: i32, y: i32) -> Option<Action> {
+        if y < self.title_h() || y >= self.menu_h() {
+            return None;
+        }
+        self.bar_toggles().into_iter().find(|&(bx, bw, _, _)| x >= bx && x < bx + bw).map(|(_, _, _, action)| action)
     }
 
     fn bar_title_at(&mut self, x: i32, y: i32) -> Option<usize> {
@@ -2140,7 +2489,11 @@ impl App {
             self.refresh_option_states();
         }
         let (x, _) = self.bar_titles()[i];
-        let items = if BAR[i].0 == "Bookmarks" { self.bookmark_menu() } else { BAR[i].1 };
+        let items = match BAR[i].0 {
+            "Bookmarks" => self.bookmark_menu(),
+            "Theme" => theme_menu(),
+            _ => BAR[i].1,
+        };
         self.menu = Some(Menu { x, y: self.menu_h(), hover: None, items, bar: Some(i) });
     }
 
@@ -2328,7 +2681,7 @@ impl App {
             Key::Sym(K_END) if !ctrl => self.move_caret(self.query.len(), shift),
             Key::Sym(K_ESCAPE) => {
                 if self.query.is_empty() {
-                    return Ok(false);
+                    return Ok(self.dismiss());
                 }
                 self.clear_query();
             }
@@ -2373,6 +2726,7 @@ impl App {
             Key::Sym(K_F4) => self.act(Action::Edit, time),
             Key::Sym(K_F5) => self.reindex()?,
             Key::Sym(K_F6) => self.toggle_tree(),
+            Key::Sym(K_F7) => self.act(Action::Toggle(Flag::SizeMap), time),
             _ => {}
         }
         Ok(true)
@@ -2412,6 +2766,8 @@ impl App {
             1 if y < self.menu_h() => {
                 if let Some(title) = self.bar_title_at(x, y) {
                     self.open_bar_menu(title);
+                } else if let Some(action) = self.bar_toggle_at(x, y) {
+                    self.act(action, time);
                 }
             }
             1 if y < self.box_h() => {
@@ -2582,14 +2938,14 @@ impl App {
         self.text.height + 6 * self.u
     }
 
-    /// Height of our own title bar (0 when the desktop draws one).
+    /// Height of a separate title bar: none, since ours is the menu bar.
     fn title_h(&self) -> i32 {
-        if self.custom_title { self.row_h() + 10 * self.u } else { 0 }
+        0
     }
 
-    /// Bottom edge of the menu bar.
+    /// Bottom edge of the menu bar, taller when it is also the title bar.
     fn menu_h(&self) -> i32 {
-        self.title_h() + self.row_h()
+        if self.custom_title { self.row_h() + 12 * self.u } else { self.row_h() }
     }
 
     /// Bottom edge of the search box area (where the column headers start).
@@ -2648,28 +3004,45 @@ impl App {
         let (u, row_h, bar) = (self.u, self.row_h(), self.bar_w());
         let pad = 8 * u;
         let cols = self.columns();
-        self.cv.fill(0, 0, w, h, WHITE);
+        // The window base, with the results list as a lighter layer on it.
+        self.cv.fill(0, 0, w, h, PANEL);
+        self.cv.fill(0, self.box_h(), w, h - self.box_h() - row_h, palette::CARD);
+        self.cv.fill(0, self.box_h(), w, 1, LINE);
 
-        // Search box: text scrolled to keep the caret visible, selection
-        // highlighted, all clipped to the inside of the box.
+        // Search box (a Windows 11 text box: rounded, a hairline border,
+        // and an accent line along the bottom while it has the focus):
+        // text scrolled to keep the caret visible, selection highlighted,
+        // all clipped to the inside of the box.
         let top = self.menu_h();
-        self.cv.fill(0, top, w, self.box_h() - top, PANEL);
-        self.cv.fill(6 * u, top + 6 * u, w - 12 * u, row_h + 2 * u, WHITE);
-        self.cv.frame(6 * u, top + 6 * u, w - 12 * u, row_h + 2 * u, u.max(1), 0x8fb4e8);
+        let (bx, by, bw, bh) = (6 * u, top + 6 * u, w - 12 * u, row_h + 2 * u);
+        self.cv.round_frame(bx, by, bw, bh, 4 * u, u.max(1), LINE, WHITE);
+        self.cv.clip = (bx + 3 * u, bx + bw - 3 * u);
+        self.cv.fill(bx, by + bh - 2 * u, bw, 2 * u, SELECT);
+        self.cv.clip = (0, i32::MAX);
 
         // Title bar (ours) and menu bar.
         let th = self.title_h();
         if self.custom_title {
             self.draw_title_bar();
         }
-        self.cv.fill(0, th, w, top - th, WHITE);
-        self.cv.fill(0, top - 1, w, 1, LINE);
         let open = self.menu.as_ref().and_then(|m| m.bar);
         for (i, (x, tw)) in self.bar_titles().into_iter().enumerate() {
             if open == Some(i) {
-                self.cv.fill(x, th, tw, top - 1 - th, HOVER);
+                self.cv.round(x + 2 * u, th + 2 * u, tw - 4 * u, top - th - 4 * u, 4 * u, palette::PICKED);
             }
-            self.text.draw(&mut self.cv, x + 9 * u, th + 3 * u, tr(BAR[i].0), tw, TEXT);
+            self.text.draw(&mut self.cv, x + 9 * u, (top - self.text.height) / 2, tr(BAR[i].0), tw, TEXT);
+        }
+        for (x, bw, label, action) in self.bar_toggles() {
+            let bh = row_h - 5 * u;
+            let y = (top - bh) / 2;
+            let on = self.checked(action);
+            if on {
+                self.cv.round(x, y, bw, bh, 4 * u, SELECT);
+            } else {
+                self.cv.round_frame(x, y, bw, bh, 4 * u, u.max(1), LINE, WHITE);
+            }
+            let ty = y + (bh - self.text.height) / 2;
+            self.text.draw(&mut self.cv, x + 10 * u, ty, tr(label), bw, if on { ON_ACCENT } else { TEXT });
         }
         if self.tree.is_some() {
             self.draw_tree();
@@ -2694,17 +3067,17 @@ impl App {
             self.cv.fill(tx + caret, ty, u.max(1), self.text.height, TEXT);
             self.cv.clip = (0, i32::MAX);
 
-            // Column headers with the sort direction.
+            // Column headers with the sort direction, quiet, on the list.
             let y = self.box_h();
-            self.cv.fill(0, y, w, row_h, PANEL);
-            self.cv.fill(0, y + row_h, w, 1, LINE);
+            self.cv.fill(pad, y + row_h, w - 2 * pad, 1, LINE);
             let heads = [("Name", Sort::Name), ("Path", Sort::Path), ("Size", Sort::Size), ("Modified", Sort::Mtime)];
             for (i, ((label, sort), (x, cw))) in heads.into_iter().zip(cols).enumerate() {
                 let mark = if self.sort != sort { "" } else if self.reverse { "  ▼" } else { "  ▲" };
                 if i > 0 {
-                    self.cv.fill(x, y + 4 * u, 1, row_h - 8 * u, LINE);
+                    self.cv.fill(x, y + 6 * u, 1, row_h - 12 * u, LINE);
                 }
-                self.text.draw(&mut self.cv, x + pad, y + 3 * u, &format!("{}{mark}", tr(label)), cw - 2 * pad, TEXT);
+                let ink = if self.sort == sort { TEXT } else { DIM };
+                self.text.draw(&mut self.cv, x + pad, y + 3 * u, &format!("{}{mark}", tr(label)), cw - 2 * pad, ink);
             }
 
             // Result rows.
@@ -2716,13 +3089,15 @@ impl App {
                 let Some(&id) = self.hits.get(self.top + row) else { break };
                 let y = list_top + row as i32 * row_h;
                 let selected = self.is_selected(self.top + row);
+                // Selected rows: filled across in the accent colour, with
+                // white text; the row under the pointer: a rounded tint.
                 let (fg, dim) = if selected { (ON_ACCENT, ON_ACCENT) } else { (TEXT, DIM) };
                 if selected {
                     self.cv.fill(0, y, w - bar, row_h, SELECT);
                 } else if self.hover_row == Some(self.top + row) {
-                    self.cv.fill(0, y, w - bar, row_h, 0xe6f0fc);
+                    self.cv.round(4 * u, y + u, w - bar - 6 * u, row_h - 2 * u, 4 * u, HOVER);
                 } else if self.flag(Flag::AltRows) && (self.top + row) % 2 == 1 {
-                    self.cv.fill(0, y, w - bar, row_h, 0xf5f7f9);
+                    self.cv.fill(0, y, w - bar, row_h, 0xf6f6f6);
                 }
                 let is_dir = self.index.is_dir(id);
                 let name = String::from_utf8_lossy(self.index.name(id)).into_owned();
@@ -2753,8 +3128,9 @@ impl App {
             if self.hits.len() > rows {
                 let (track, thumb) = self.scrollbar();
                 let pos = ((track - thumb) as i64 * self.top as i64 / self.max_top().max(1) as i64) as i32;
-                self.cv.fill(w - bar, list_top, bar, track, PANEL);
-                self.cv.fill(w - bar + 2 * u, list_top + pos, bar - 4 * u, thumb, 0xa6a6a6);
+                // A thin rounded thumb, as Windows 11 draws scrollbars.
+                let tw = 4 * u;
+                self.cv.round(w - bar + (bar - tw) / 2, list_top + pos + 2 * u, tw, thumb - 4 * u, tw / 2, palette::QUIET);
             }
         }
 
@@ -2762,7 +3138,10 @@ impl App {
         let y = h - row_h;
         self.cv.fill(0, y, w, row_h, PANEL);
         self.cv.fill(0, y, w, 1, LINE);
-        let status = if self.status.is_empty() && self.tree.is_some() {
+        let progress = self.build_status();
+        let status = if let Some((text, _)) = &progress {
+            text.clone()
+        } else if self.status.is_empty() && self.tree.is_some() {
             self.tree_status()
         } else if self.status.is_empty() {
             let kind = tr(["all", "files", "folders"][self.kind as usize]);
@@ -2802,7 +3181,28 @@ impl App {
             self.status.clone()
         };
         let grip = if self.custom_title { GRIP * u } else { 0 };
-        self.text.draw(&mut self.cv, pad, y + 3 * u, &status, w - 2 * pad - grip, TEXT);
+        // While indexing, a progress bar at the right end: filled to the
+        // share done when the size is known, else a block sweeping across.
+        let mut text_room = w - 2 * pad - grip;
+        if let Some((_, share)) = progress {
+            let (bw, bh) = (220 * u, row_h - 10 * u);
+            if w > 3 * bw {
+                let (bx, by) = (w - pad - grip - bw, y + 5 * u);
+                self.cv.fill(bx, by, bw, bh, LINE);
+                match share {
+                    Some(share) => self.cv.fill(bx, by, (bw as f64 * share) as i32, bh, SELECT),
+                    None => {
+                        let span = bw / 4;
+                        let t = self.building.as_ref().map_or(0, |b| b.started.elapsed().as_millis() as i32);
+                        let x = (t / 4) % (bw + span) - span;
+                        let (from, to) = (x.max(0), (x + span).min(bw));
+                        self.cv.fill(bx + from, by, (to - from).max(0), bh, SELECT);
+                    }
+                }
+                text_room -= bw + pad;
+            }
+        }
+        self.text.draw(&mut self.cv, pad, y + 3 * u, &status, text_room, TEXT);
         // The resize grip: dots in a triangle in the corner.
         if self.custom_title {
             let dot = ((2.0 * self.scale).round() as i32).max(2);
@@ -2826,7 +3226,10 @@ impl App {
             self.draw_about();
         }
         if self.custom_title {
-            self.cv.frame(0, 0, w, h, 1, 0x8c8c8c); // the window's own border
+            // The window's own border (Windows draws one itself).
+            if cfg!(not(windows)) {
+                self.cv.frame(0, 0, w, h, 1, 0x8c8c8c);
+            }
         }
         self.present()
     }
@@ -2843,8 +3246,10 @@ impl App {
             return self.on_tree_target(|app| app.refusal(action)).flatten();
         }
         // A huge selection is not checked to the end: what cannot be
-        // done is then reported when it is tried.
-        let blocked = self.selected_rows().into_iter().take(200).any(|row| {
+        // done is then reported when it is tried. On Windows a check
+        // opens the file, so only the first is looked at.
+        let checked = if cfg!(windows) { 1 } else { 200 };
+        let blocked = self.selected_rows().into_iter().take(checked).any(|row| {
             let path = self.index.path(self.hits[row]);
             if delete { !may_delete(&path) } else { !may_read(&path) }
         });
@@ -2858,15 +3263,15 @@ impl App {
     fn draw_menu(&mut self, menu: &Menu) {
         let (u, row_h) = (self.u, self.row_h());
         let (x, y, w, h) = self.menu_rect(menu);
-        self.cv.fill(x + 3 * u, y + 3 * u, w, h, 0xbdbdbd); // shadow
-        self.cv.fill(x, y, w, h, WHITE);
-        self.cv.frame(x, y, w, h, u.max(1), 0x9a9a9a);
+        // A Windows 11 flyout: rounded, a hairline border, a soft shadow.
+        self.cv.round(x + u, y + 2 * u, w, h, 8 * u, 0xd6d6d6);
+        self.cv.round_frame(x, y, w, h, 8 * u, u.max(1), 0xd0d0d0, WHITE);
         for (i, (label, shortcut, action)) in menu.items.iter().enumerate() {
             let iy = y + 4 * u + i as i32 * row_h;
             // Entries the user has no permission for are greyed.
             let off = self.refusal(*action).is_some();
             if menu.hover == Some(i) && !off {
-                self.cv.fill(x + u, iy, w - 2 * u, row_h, HOVER);
+                self.cv.round(x + 4 * u, iy + u, w - 8 * u, row_h - 2 * u, 4 * u, HOVER);
             }
             // A bullet marks active choices and switched-on options.
             if self.checked(*action) {
@@ -2908,7 +3313,7 @@ impl App {
         let (cw, ch) = (self.cv.w as i32, self.cv.h as i32);
         let lines = [
             ("Fast search".to_string(), TEXT),
-            (trf("Version {}", &[&env!("CARGO_PKG_VERSION")]), DIM),
+            (trf("Version {}", &[&ff_core::update::VERSION]), DIM),
             (String::new(), DIM),
             (tr("Instant file search for Linux").to_string(), TEXT),
             (trf("{} files and folders indexed", &[&group_digits(self.index.len() as u64)]), TEXT),
@@ -2938,7 +3343,7 @@ impl App {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
@@ -2974,5 +3379,20 @@ mod tests {
 
         mode(&dir.join("locked"), 0o755);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod portable_tests {
+    use super::trim_folder;
+
+    #[test]
+    fn typed_folders_lose_trailing_separators_but_roots_stay_whole() {
+        assert_eq!(trim_folder("/home/me/Videos/"), "/home/me/Videos");
+        assert_eq!(trim_folder("/"), "/");
+        if cfg!(windows) {
+            assert_eq!(trim_folder(r"C:\Users\me\"), r"C:\Users\me");
+            assert_eq!(trim_folder(r"C:\"), r"C:\");
+        }
     }
 }

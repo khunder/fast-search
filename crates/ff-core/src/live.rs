@@ -6,11 +6,7 @@
 //! whatever the order or kind of events (create, delete, rename, write).
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
 use std::fs;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
 
 use crate::index::{FLAG_DIR, Index};
 use crate::walk::type_flags;
@@ -27,8 +23,8 @@ pub struct LiveIndex {
 
 fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
     let mut path = dir.to_vec();
-    if !path.ends_with(b"/") {
-        path.push(b'/');
+    if !path.last().is_some_and(|&b| crate::os::is_sep(b)) {
+        path.push(crate::os::SEP);
     }
     path.extend_from_slice(name);
     path
@@ -78,11 +74,11 @@ impl LiveIndex {
     /// True if `path` is an excluded directory or inside one.
     fn excluded(&self, path: &[u8]) -> bool {
         // With hidden names left out, so is anything below a hidden folder.
-        let hidden = self.index.skips_hidden() && path.split(|&b| b == b'/').any(|part| part.starts_with(b"."));
+        let hidden = self.index.skips_hidden() && path.split(|&b| crate::os::is_sep(b)).any(|part| part.starts_with(b"."));
         hidden
             || crate::walk::in_trash(path)
             || self.index.excludes.iter().any(|x| {
-                path.strip_prefix(&x[..]).is_some_and(|rest| rest.is_empty() || rest[0] == b'/' || x.ends_with(b"/"))
+                path.strip_prefix(&x[..]).is_some_and(|rest| rest.is_empty() || crate::os::is_sep(rest[0]) || x.last().is_some_and(|&b| crate::os::is_sep(b)))
             })
     }
 
@@ -125,14 +121,14 @@ impl LiveIndex {
         for (dir, name, old) in work {
             self.index.write_path(dir, &mut dir_path);
             let path = join(&dir_path, &name);
-            let md = fs::symlink_metadata(OsStr::from_bytes(&path)).ok();
+            let md = fs::symlink_metadata(crate::os::path_from_bytes(&path)).ok();
             let flags = md.as_ref().map(|m| type_flags(m.file_type()));
             match (md, old) {
                 // Still there, same kind: refresh size and time in place.
                 (Some(md), Some(id)) if flags == Some(self.index.flags[id as usize]) => {
                     let i = id as usize;
-                    changed |= (self.index.size[i], self.index.mtime[i]) != (md.size(), md.mtime());
-                    self.index.set_meta(id, md.size(), md.mtime());
+                    changed |= (self.index.size[i], self.index.mtime[i]) != (crate::os::size(&md), crate::os::mtime(&md));
+                    self.index.set_meta(id, crate::os::size(&md), crate::os::mtime(&md));
                 }
                 (md, old) => {
                     changed |= md.is_some() || old.is_some();
@@ -163,7 +159,7 @@ impl LiveIndex {
     /// Adds an entry and, for a directory, everything inside it.
     fn add_tree(&mut self, path: Vec<u8>, parent: u32, name: &[u8], md: &fs::Metadata) {
         let flags = type_flags(md.file_type());
-        let id = self.index.push(name, parent, flags, md.size(), md.mtime());
+        let id = self.index.push(name, parent, flags, crate::os::size(md), crate::os::mtime(md));
         if flags != FLAG_DIR {
             return;
         }
@@ -173,17 +169,17 @@ impl LiveIndex {
             if self.excluded(&dir) {
                 continue; // listed, but never descended into
             }
-            let Ok(rd) = fs::read_dir(PathBuf::from(OsStr::from_bytes(&dir))) else { continue };
+            let Ok(rd) = fs::read_dir(crate::os::path_from_bytes(&dir)) else { continue };
             for entry in rd.flatten() {
                 let Ok(md) = entry.metadata() else { continue };
                 let name = entry.file_name();
-                if self.index.skips_hidden() && name.as_bytes().starts_with(b".") {
+                if self.index.skips_hidden() && (crate::os::bytes(&name).starts_with(b".") || crate::os::hidden_attribute(&md)) {
                     continue;
                 }
                 let flags = type_flags(md.file_type());
-                let id = self.index.push(name.as_bytes(), dir_id, flags, md.size(), md.mtime());
+                let id = self.index.push(crate::os::bytes(&name), dir_id, flags, crate::os::size(&md), crate::os::mtime(&md));
                 if flags == FLAG_DIR {
-                    stack.push((join(&dir, name.as_bytes()), id));
+                    stack.push((join(&dir, crate::os::bytes(&name)), id));
                 }
             }
         }
@@ -201,9 +197,9 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("keep")).unwrap();
         fs::write(root.join("keep/old.txt"), "1").unwrap();
-        let root = fs::canonicalize(&root).unwrap();
+        let root = crate::os::canonicalize(&root).unwrap();
         let mut live = LiveIndex::new(Index::build(&BuildOptions::new([&root])).unwrap());
-        let root_bytes = root.as_os_str().as_bytes().to_vec();
+        let root_bytes = crate::os::path_bytes(&root).to_vec();
         let change = |dir: &[u8], name: &str| HashSet::from([(dir.to_vec(), name.as_bytes().to_vec())]);
         let count = |live: &LiveIndex, q: &str| live.index().search(&Query::parse(q), &SearchOptions::default()).len();
 

@@ -56,7 +56,7 @@ pub fn trf(template: &str, values: &[&dyn std::fmt::Display]) -> String {
 }
 
 /// English text and its [French, Spanish, Italian] translations.
-const TEXTS: [(&str, [&str; 3]); 305] = [
+const TEXTS: &[(&str, [&str; 3])] = &[
     ("File", ["Fichier", "Archivo", "File"]),
     ("Edit", ["Édition", "Editar", "Modifica"]),
     ("View", ["Affichage", "Ver", "Visualizza"]),
@@ -90,7 +90,7 @@ const TEXTS: [(&str, [&str; 3]); 305] = [
     ("Zoom in", ["Zoom avant", "Acercar", "Ingrandisci"]),
     ("Zoom out", ["Zoom arrière", "Alejar", "Riduci"]),
     ("Reset zoom", ["Réinitialiser le zoom", "Restablecer el zoom", "Reimposta lo zoom"]),
-    ("Title bar with icon", ["Barre de titre avec icône", "Barra de título con icono", "Barra del titolo con icona"]),
+    ("Menus in the title bar", ["Menus dans la barre de titre", "Menús en la barra de título", "Menu nella barra del titolo"]),
     ("Global shortcut", ["Raccourci global", "Atajo global", "Scorciatoia globale"]),
     ("Show in applications menu", ["Afficher dans le menu des applications", "Mostrar en el menú de aplicaciones", "Mostra nel menu delle applicazioni"]),
     ("Live updates service", ["Service de mise à jour en direct", "Servicio de actualización en vivo", "Servizio di aggiornamento in tempo reale"]),
@@ -120,6 +120,11 @@ const TEXTS: [(&str, [&str; 3]); 305] = [
     ("folder", ["dossier", "carpeta", "cartella"]),
     ("{} bytes", ["{} octets", "{} bytes", "{} byte"]),
     ("Indexing...", ["Indexation...", "Indexando...", "Indicizzazione..."]),
+    ("Indexing... {} entries", ["Indexation... {} éléments", "Indexando... {} elementos", "Indicizzazione... {} elementi"]),
+    ("Indexed {} entries in {} s", ["{} éléments indexés en {} s", "{} elementos indexados en {} s", "{} elementi indicizzati in {} s"]),
+    ("Size map", ["Carte des tailles", "Mapa de tamaños", "Mappa delle dimensioni"]),
+    ("Show the size map beside the folder sizes", ["Afficher la carte des tailles à côté des dossiers", "Mostrar el mapa de tamaños junto a las carpetas", "Mostra la mappa delle dimensioni accanto alle cartelle"]),
+    ("show or hide the size map beside the folder sizes", ["afficher ou masquer la carte des tailles", "mostrar u ocultar el mapa de tamaños", "mostra o nascondi la mappa delle dimensioni"]),
     ("Opening {}", ["Ouverture de {}", "Abriendo {}", "Apertura di {}"]),
     ("Opening {} items", ["Ouverture de {} éléments", "Abriendo {} elementos", "Apertura di {} elementi"]),
     ("Opening {} in the text editor", ["Ouverture de {} dans l'éditeur de texte", "Abriendo {} en el editor de texto", "Apertura di {} nell'editor di testo"]),
@@ -179,7 +184,7 @@ const TEXTS: [(&str, [&str; 3]); 305] = [
     ("Live updates", ["Mises à jour en direct", "Actualización en vivo", "Aggiornamenti in tempo reale"]),
     ("Drives", ["Disques", "Unidades", "Unità"]),
     ("Exclude", ["Exclusions", "Excluir", "Esclusioni"]),
-    ("Title bar with the application icon", ["Barre de titre avec l'icône de l'application", "Barra de título con el icono de la aplicación", "Barra del titolo con l'icona dell'applicazione"]),
+    ("Menus in the title bar, with the application icon", ["Menus dans la barre de titre, avec l'icône de l'application", "Menús en la barra de título, con el icono de la aplicación", "Menu nella barra del titolo, con l'icona dell'applicazione"]),
     ("Zoom", ["Zoom", "Zoom", "Zoom"]),
     ("Reset to the desktop scale", ["Revenir à l'échelle du bureau", "Volver a la escala del escritorio", "Torna alla scala del desktop"]),
     ("Theme", ["Thème", "Tema", "Tema"]),
@@ -216,6 +221,10 @@ const TEXTS: [(&str, [&str; 3]); 305] = [
     ("To change it, type the keys, such as Ctrl+Alt+F, and press Enter:", ["Pour le changer, tapez les touches, par exemple Ctrl+Alt+F, puis Entrée :", "Para cambiarlo, escriba las teclas, por ejemplo Ctrl+Alt+F, y pulse Intro:", "Per cambiarla, digita i tasti, ad esempio Ctrl+Alt+F, e premi Invio:"]),
     ("{} now opens Fast search", ["{} ouvre maintenant Fast search", "{} ahora abre Fast search", "{} ora apre Fast search"]),
     ("Show in the applications menu", ["Afficher dans le menu des applications", "Mostrar en el menú de aplicaciones", "Mostra nel menu delle applicazioni"]),
+    ("Closing the window keeps it in the notification area", ["Fermer la fenêtre la garde dans la zone de notification", "Cerrar la ventana la mantiene en el área de notificación", "Chiudere la finestra la tiene nell'area di notifica"]),
+    ("Open Fast search", ["Ouvrir Fast search", "Abrir Fast search", "Apri Fast search"]),
+    ("Exit", ["Quitter", "Salir", "Esci"]),
+    ("Start at sign-in, in the notification area", ["Démarrer à l'ouverture de session, dans la zone de notification", "Iniciar al iniciar sesión, en el área de notificación", "Avvia all'accesso, nell'area di notifica"]),
     ("Keep the index current with the live updates service", ["Tenir l'index à jour avec le service de mise à jour en direct", "Mantener el índice actualizado con el servicio en vivo", "Mantieni l'indice aggiornato con il servizio in tempo reale"]),
     ("Switching it asks for your password. Everyone in your group can then", ["Le changer demande votre mot de passe. Tous les membres de votre groupe pourront", "Cambiarlo pide su contraseña. Todos los miembros de su grupo podrán", "Cambiarlo richiede la password. Tutti i membri del tuo gruppo potranno"]),
     ("search the names of all files on this computer.", ["rechercher les noms de tous les fichiers de cet ordinateur.", "buscar los nombres de todos los archivos de este equipo.", "cercare i nomi di tutti i file di questo computer."]),

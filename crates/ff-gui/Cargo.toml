@@ -7,4 +7,7 @@ license.workspace = true
 
 [dependencies]
 ff-core = { path = "../ff-core" }
+
+# Windows draws text with GDI; elsewhere fonts are read and drawn here.
+[target.'cfg(not(windows))'.dependencies]
 ttf-parser = { version = "0.25.1", default-features = false, features = ["std", "variable-fonts"] }

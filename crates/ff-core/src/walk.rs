@@ -1,9 +1,8 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::thread;
 
@@ -31,7 +30,7 @@ impl BuildOptions {
     pub fn new<P: Into<PathBuf>>(roots: impl IntoIterator<Item = P>) -> Self {
         BuildOptions {
             roots: roots.into_iter().map(Into::into).collect(),
-            excludes: ["/proc", "/sys", "/dev", "/run", "/.snapshots"].map(PathBuf::from).into(),
+            excludes: crate::os::default_excludes(),
             threads: 0,
             skip_hidden: false,
         }
@@ -41,14 +40,14 @@ impl BuildOptions {
     /// (root `/` with the default excludes if `old` is empty).
     pub fn refresh(old: &Index) -> Self {
         if old.is_empty() {
-            return Self::new(["/"]);
+            return Self::new(crate::os::default_roots());
         }
         // Roots that are not folders came from a device read directly
         // (`ff index --device`); those are not walked.
         let mut opts = Self::new(old.roots().map(|r| old.path(r)).filter(|p| p.is_dir()));
         opts.skip_hidden = old.skips_hidden();
         if opts.roots.is_empty() {
-            return Self::new(["/"]);
+            return Self::new(crate::os::default_roots());
         }
         opts.excludes = old.excludes().collect();
         opts
@@ -66,9 +65,15 @@ impl Index {
     /// Walks the roots in parallel and builds a fresh index. Symlinks are
     /// recorded but not followed; unreadable directories are skipped.
     pub fn build(opts: &BuildOptions) -> io::Result<Index> {
+        Self::build_with_progress(opts, &AtomicUsize::new(0))
+    }
+
+    /// As [`Index::build`], counting the entries found so far in
+    /// `progress` as the walk goes, for a progress display.
+    pub fn build_with_progress(opts: &BuildOptions, progress: &AtomicUsize) -> io::Result<Index> {
         let mut roots = Vec::new();
         for r in &opts.roots {
-            let p = fs::canonicalize(r).map_err(|e| with_path(e, r))?;
+            let p = crate::os::canonicalize(r).map_err(|e| with_path(e, r))?;
             if !p.is_dir() {
                 return Err(with_path(io::ErrorKind::NotADirectory.into(), &p));
             }
@@ -84,16 +89,27 @@ impl Index {
         }
 
         let mut index = Index::new();
-        index.excludes = opts
+        let mut excludes: Vec<Vec<u8>> = opts
             .excludes
             .iter()
-            .map(|e| fs::canonicalize(e).unwrap_or_else(|_| e.clone()).into_os_string().into_encoded_bytes())
+            .map(|e| crate::os::path_bytes(&crate::os::canonicalize(e).unwrap_or_else(|_| e.clone())).to_vec())
             .collect();
+        if opts.skip_hidden {
+            excludes.push(HIDDEN_MARK.to_vec());
+        }
+
+        // NTFS volumes are read from their master file table when we may
+        // (as administrator); only what is left is walked.
+        #[cfg(windows)]
+        let kept = {
+            let prune = crate::rawfs::Prune { excludes: &excludes, skip_hidden: opts.skip_hidden };
+            crate::rawfs::index_volumes(kept, &mut index, &prune, progress)
+        };
 
         let mut stack = Vec::new();
         for r in kept {
             let md = fs::metadata(&r).map_err(|e| with_path(e, &r))?;
-            let id = index.push(r.as_os_str().as_bytes(), NO_PARENT, FLAG_DIR, md.size(), md.mtime());
+            let id = index.push(crate::os::path_bytes(&r), NO_PARENT, FLAG_DIR, crate::os::size(&md), crate::os::mtime(&md));
             stack.push((r, id));
         }
 
@@ -101,15 +117,11 @@ impl Index {
             0 => thread::available_parallelism().map_or(4, |n| n.get()).min(16),
             n => n,
         };
-        if opts.skip_hidden {
-            index.excludes.push(HIDDEN_MARK.to_vec());
-        }
-        let excludes = std::mem::take(&mut index.excludes);
         let index = Mutex::new(index);
         let queue = (Mutex::new(Queue { stack, active: 0 }), Condvar::new());
         thread::scope(|s| {
             for _ in 0..threads {
-                s.spawn(|| worker(&queue, &index, &excludes));
+                s.spawn(|| worker(&queue, &index, &excludes, progress));
             }
         });
         let mut index = index.into_inner().unwrap();
@@ -122,7 +134,7 @@ fn with_path(e: io::Error, path: &Path) -> io::Error {
     io::Error::new(e.kind(), format!("{}: {e}", path.display()))
 }
 
-fn worker(queue: &(Mutex<Queue>, Condvar), index: &Mutex<Index>, excludes: &[Vec<u8>]) {
+fn worker(queue: &(Mutex<Queue>, Condvar), index: &Mutex<Index>, excludes: &[Vec<u8>], progress: &AtomicUsize) {
     let (lock, cond) = queue;
     let mut batch: Vec<(OsString, u8, u64, i64)> = Vec::new();
     let mut dirs: Vec<(OsString, u32)> = Vec::new();
@@ -145,11 +157,12 @@ fn worker(queue: &(Mutex<Queue>, Condvar), index: &Mutex<Index>, excludes: &[Vec
         if let Ok(rd) = fs::read_dir(&dir) {
             let skip_hidden = excludes.iter().any(|x| x == HIDDEN_MARK);
             for entry in rd.flatten() {
-                if skip_hidden && entry.file_name().as_bytes().starts_with(b".") {
+                if skip_hidden && crate::os::bytes(&entry.file_name()).starts_with(b".") {
                     continue;
                 }
                 let (flags, size, mtime) = match entry.metadata() {
-                    Ok(md) => (type_flags(md.file_type()), md.size(), md.mtime()),
+                    Ok(md) if skip_hidden && crate::os::hidden_attribute(&md) => continue,
+                    Ok(md) => (type_flags(md.file_type()), crate::os::size(&md), crate::os::mtime(&md)),
                     Err(_) => (entry.file_type().map_or(0, type_flags), 0, 0),
                 };
                 batch.push((entry.file_name(), flags, size, mtime));
@@ -159,8 +172,9 @@ fn worker(queue: &(Mutex<Queue>, Condvar), index: &Mutex<Index>, excludes: &[Vec
         // One short critical section per directory keeps contention low.
         {
             let mut ix = index.lock().unwrap();
+            progress.fetch_add(batch.len(), Ordering::Relaxed);
             for (name, flags, size, mtime) in batch.drain(..) {
-                let id = ix.push(name.as_bytes(), dir_id, flags, size, mtime);
+                let id = ix.push(crate::os::bytes(&name), dir_id, flags, size, mtime);
                 if flags == FLAG_DIR {
                     dirs.push((name, id));
                 }
@@ -170,8 +184,8 @@ fn worker(queue: &(Mutex<Queue>, Condvar), index: &Mutex<Index>, excludes: &[Vec
         let subdirs: Vec<(PathBuf, u32)> = dirs
             .drain(..)
             .map(|(name, id)| (dir.join(name), id))
-            .filter(|(p, _)| !excludes.iter().any(|x| x == p.as_os_str().as_bytes()))
-            .filter(|(p, _)| !in_trash(p.as_os_str().as_bytes()))
+            .filter(|(p, _)| !excludes.iter().any(|x| x == crate::os::path_bytes(p)))
+            .filter(|(p, _)| !in_trash(crate::os::path_bytes(p)))
             .collect();
 
         let mut q = lock.lock().unwrap();
@@ -185,12 +199,14 @@ fn worker(queue: &(Mutex<Queue>, Condvar), index: &Mutex<Index>, excludes: &[Vec
 /// True if `path` is a desktop trash folder or inside one: the user's
 /// `~/.local/share/Trash`, or a drive's `.Trash` / `.Trash-<uid>`. Trashed
 /// files are never indexed (the folder itself is listed, not its content).
+/// On Windows, a drive's `$Recycle.Bin` too.
 pub(crate) fn in_trash(path: &[u8]) -> bool {
-    let parts: Vec<&[u8]> = path.split(|&b| b == b'/').collect();
+    let parts: Vec<&[u8]> = path.split(|&b| crate::os::is_sep(b)).collect();
     parts.iter().enumerate().any(|(i, part)| {
         *part == b".Trash"
             || part.starts_with(b".Trash-")
             || (*part == b"Trash" && i >= 2 && parts[i - 1] == b"share" && parts[i - 2] == b".local")
+            || (cfg!(windows) && part.eq_ignore_ascii_case(b"$Recycle.Bin"))
     })
 }
 

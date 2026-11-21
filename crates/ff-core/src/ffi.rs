@@ -3,8 +3,7 @@
 //! All functions tolerate NULL handles (returning NULL / 0 / -1). Strings are
 //! NUL-terminated byte strings; paths need not be valid UTF-8.
 
-use std::ffi::{CStr, OsStr, c_char, c_int};
-use std::os::unix::ffi::OsStrExt;
+use std::ffi::{CStr, c_char, c_int};
 use std::path::PathBuf;
 
 use crate::{BuildOptions, CaseMode, Index, Kind, Query, SearchOptions, Sort};
@@ -19,7 +18,7 @@ unsafe fn path_arg(p: *const c_char) -> Option<PathBuf> {
     if p.is_null() {
         return None;
     }
-    Some(OsStr::from_bytes(unsafe { CStr::from_ptr(p) }.to_bytes()).into())
+    Some(crate::os::path_from_bytes(unsafe { CStr::from_ptr(p) }.to_bytes()))
 }
 
 unsafe fn path_list(list: *const *const c_char, n: usize) -> Vec<PathBuf> {
@@ -178,7 +177,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ff_ffi_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("needle.txt"), "abc").unwrap();
-        let root = CString::new(dir.as_os_str().as_bytes()).unwrap();
+        let root = CString::new(crate::os::path_bytes(&dir)).unwrap();
         let roots = [root.as_ptr()];
         unsafe {
             let ix = ff_index_build(roots.as_ptr(), 1, std::ptr::null(), 0);
@@ -194,7 +193,7 @@ mod tests {
             let len = ff_results_path(res, 0, buf.as_mut_ptr(), buf.len());
             let path = CStr::from_ptr(buf.as_ptr()).to_bytes();
             assert_eq!(path.len(), len);
-            assert!(path.ends_with(b"/needle.txt"));
+            assert!(path.ends_with(&[&[crate::os::SEP][..], b"needle.txt"].concat()));
             assert_eq!(ff_results_path(res, 0, buf.as_mut_ptr(), 4), len);
             assert_eq!(CStr::from_ptr(buf.as_ptr()).to_bytes().len(), 3);
             ff_results_free(res);
