@@ -146,6 +146,8 @@ enum Action {
     Toggle(Flag),
     /// Colours: 0 follow the desktop, 1 light, 2 dark.
     Theme(u8),
+    /// 0: the desktop's accent colour; n: canvas::ACCENTS[n - 1].
+    Accent(u8),
     /// 0 follow the system, 1 English, 2 French, 3 Spanish, 4 Italian.
     Language(u8),
     /// How sizes are written: 0 automatic, 1 bytes, 2 KB, 3 MB.
@@ -360,6 +362,22 @@ fn theme_choices() -> Items {
     })
 }
 
+/// The desktop's accent colour and every one of `canvas::ACCENTS`, as
+/// menu entries: built once.
+fn accent_choices() -> Items {
+    static CHOICES: std::sync::OnceLock<Vec<(&'static str, &'static str, Action)>> = std::sync::OnceLock::new();
+    CHOICES.get_or_init(|| {
+        let accents = canvas::ACCENTS.iter().enumerate().map(|(i, a)| (a.0, "", Action::Accent(i as u8 + 1)));
+        std::iter::once(("System accent", "", Action::Accent(0))).chain(accents).collect()
+    })
+}
+
+/// The Theme menu: the themes, then the accent colours.
+fn theme_menu() -> Items {
+    static MENU: std::sync::OnceLock<Vec<(&'static str, &'static str, Action)>> = std::sync::OnceLock::new();
+    MENU.get_or_init(|| theme_choices().iter().chain(accent_choices()).copied().collect())
+}
+
 /// An open menu: a result's right-click menu or one from the menu bar.
 struct Menu {
     x: i32,
@@ -455,6 +473,7 @@ struct App {
     flags: [bool; FLAGS.len()],
     size_format: u8,
     theme: u8,
+    accent: u8,
     language: u8,
     /// Row under the pointer, for the mouseover highlight.
     hover_row: Option<usize>,
@@ -786,6 +805,7 @@ impl App {
             flags: FLAGS.map(|(key, default)| config.more.get(key).map_or(default, |v| v == "on")),
             size_format: config.more.get("size_format").and_then(|v| v.parse().ok()).filter(|f| *f < 4).unwrap_or(2),
             theme: config.more.get("theme").and_then(|v| v.parse().ok()).filter(|&t: &u8| (t as usize) <= canvas::THEMES.len()).unwrap_or(0),
+            accent: config.more.get("accent").and_then(|v| v.parse().ok()).filter(|&a: &u8| (a as usize) <= canvas::ACCENTS.len()).unwrap_or(0),
             language: config.more.get("language").and_then(|v| v.parse().ok()).filter(|l| *l < 5).unwrap_or(0),
             hover_row: None,
             dialog_input: String::new(),
@@ -1447,6 +1467,11 @@ impl App {
                 self.apply_theme();
                 return self.save_config();
             }
+            Action::Accent(accent) => {
+                self.accent = accent;
+                self.apply_theme();
+                return self.save_config();
+            }
             Action::ToggleRegex => {
                 self.regex = !self.regex;
                 self.save_config();
@@ -2087,8 +2112,14 @@ impl App {
             None => self.theme as usize - 1,
         };
         canvas::set_theme(index);
-        // The accent colour chosen in Windows' personalization settings
-        // (stored as 0xAABBGGRR).
+        // A colour chosen here, else the desktop's: on Windows the accent
+        // colour of its personalization settings (stored as 0xAABBGGRR),
+        // elsewhere the first of the list.
+        if let Some(&(_, rgb)) = (self.accent as usize).checked_sub(1).and_then(|i| canvas::ACCENTS.get(i)) {
+            canvas::set_accent(rgb);
+            return;
+        }
+        canvas::set_accent(canvas::ACCENTS[0].1);
         #[cfg(windows)]
         if let Some(abgr) = winsys::reg_dword(winsys::HKEY_CURRENT_USER, r"Software\Microsoft\Windows\DWM", "AccentColor") {
             canvas::set_accent((abgr & 0xff) << 16 | (abgr & 0xff00) | (abgr >> 16 & 0xff));
@@ -2156,6 +2187,7 @@ impl App {
             Action::Toggle(flag) => self.flag(flag),
             Action::SizeFormat(format) => format == self.size_format,
             Action::Theme(theme) => theme == self.theme,
+            Action::Accent(accent) => accent == self.accent,
             Action::Language(language) => language == self.language,
             Action::SelectExclude(i) => i as usize == self.exclude_selected,
             Action::SelectBookmark(i) => i as usize == self.bookmark_selected,
@@ -2188,6 +2220,7 @@ impl App {
             FLAGS.iter().zip(self.flags).map(|((key, _), on)| (key.to_string(), if on { "on" } else { "off" }.to_string())).collect();
         more.insert("size_format".into(), self.size_format.to_string());
         more.insert("theme".into(), self.theme.to_string());
+        more.insert("accent".into(), self.accent.to_string());
         more.insert("language".into(), self.language.to_string());
         more.insert("shortcut".into(), self.shortcut_keys.clone());
         let config = Config { scale, own_title_bar: self.custom_title, regex: self.regex, whole_word: self.whole_word, case, more };
@@ -2389,7 +2422,7 @@ impl App {
         let (x, _) = self.bar_titles()[i];
         let items = match BAR[i].0 {
             "Bookmarks" => self.bookmark_menu(),
-            "Theme" => theme_choices(),
+            "Theme" => theme_menu(),
             _ => BAR[i].1,
         };
         self.menu = Some(Menu { x, y: self.menu_h(), hover: None, items, bar: Some(i) });

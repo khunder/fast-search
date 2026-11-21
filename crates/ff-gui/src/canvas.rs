@@ -40,8 +40,7 @@ pub const ACCENT: u32 = 0xff_fffd;
 
 static ACCENT_RGB: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x00_67c0);
 
-/// Sets the colour [`ACCENT`] stands for (on Windows, the desktop's).
-#[cfg_attr(not(windows), allow(dead_code))]
+/// Sets the colour [`ACCENT`] stands for.
 pub fn set_accent(rgb: u32) {
     ACCENT_RGB.store(rgb & 0xff_ffff, std::sync::atomic::Ordering::Relaxed);
 }
@@ -79,6 +78,19 @@ pub struct Theme {
     /// Base, card, field, stroke, hover, picked, ink, dim ink, quiet.
     colors: [u32; 9],
 }
+
+/// Accent colours to choose instead of the desktop's (Windows 11's own),
+/// as (menu label, 0xRRGGBB). The first is also the default where the
+/// desktop has none.
+pub const ACCENTS: [(&str, u32); 7] = [
+    ("Blue accent", 0x0067c0),
+    ("Teal accent", 0x038387),
+    ("Green accent", 0x107c10),
+    ("Orange accent", 0xca5010),
+    ("Red accent", 0xc42b1c),
+    ("Purple accent", 0x744da9),
+    ("Grey accent", 0x5d5a58),
+];
 
 /// Every theme. Adding one is one entry here.
 pub const THEMES: [Theme; 6] = [

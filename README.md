@@ -363,7 +363,9 @@ so results follow `ff index` runs and the daemon.
 It has six themes: Light, Dark, Graphite (dark grey), Mist (light grey),
 Dusk (blue-grey dark) and Sand (warm light). By default it follows the
 desktop's light or dark preference; choose another in the **Theme** menu
-or under **Options → Interface**. The window is
+or under **Options → Interface**. The accent colour (selection, focus)
+is the desktop's (on Windows, its accent colour) unless you pick one of
+seven at the bottom of the **Theme** menu. The window is
 available in English, French, Spanish and Italian (same page; it follows
 the system language by default). It follows the desktop scale (fractional scaling on Wayland, `Xft.dpi` on X11). Override with `FF_GUI_SCALE=1.5`
 and choose a font file with `FF_GUI_FONT=/path/to/font.ttf`.
