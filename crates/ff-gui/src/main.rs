@@ -274,7 +274,7 @@ const TEXT_CONTEXT_MENU: Items = &[
 ];
 
 /// The menu bar.
-const BAR: [(&str, Items); 6] = [
+const BAR: [(&str, Items); 7] = [
     (
         "File",
         &[
@@ -316,6 +316,8 @@ const BAR: [(&str, Items); 6] = [
             ("Size map", "F7", Action::Toggle(Flag::SizeMap)),
         ],
     ),
+    // Filled in from canvas::THEMES when it opens.
+    ("Theme", &[]),
     // Filled in from the saved bookmarks when it opens.
     ("Bookmarks", &[]),
     (
@@ -343,6 +345,16 @@ const BAR: [(&str, Items); 6] = [
         ],
     ),
 ];
+
+/// "System" (follow the desktop) and every theme of `canvas::THEMES`, as
+/// menu entries and preferences rows: built once.
+fn theme_choices() -> Items {
+    static CHOICES: std::sync::OnceLock<Vec<(&'static str, &'static str, Action)>> = std::sync::OnceLock::new();
+    CHOICES.get_or_init(|| {
+        let themes = canvas::THEMES.iter().enumerate().map(|(i, t)| (t.name, "", Action::Theme(i as u8 + 1)));
+        std::iter::once(("System", "", Action::Theme(0))).chain(themes).collect()
+    })
+}
 
 /// An open menu: a result's right-click menu or one from the menu bar.
 struct Menu {
@@ -769,7 +781,7 @@ impl App {
             dialog: None,
             flags: FLAGS.map(|(key, default)| config.more.get(key).map_or(default, |v| v == "on")),
             size_format: config.more.get("size_format").and_then(|v| v.parse().ok()).filter(|f| *f < 4).unwrap_or(2),
-            theme: config.more.get("theme").and_then(|v| v.parse().ok()).filter(|t| *t < 3).unwrap_or(0),
+            theme: config.more.get("theme").and_then(|v| v.parse().ok()).filter(|&t: &u8| (t as usize) <= canvas::THEMES.len()).unwrap_or(0),
             language: config.more.get("language").and_then(|v| v.parse().ok()).filter(|l| *l < 5).unwrap_or(0),
             hover_row: None,
             dialog_input: String::new(),
@@ -829,6 +841,7 @@ impl App {
                 self.open_bar_menu(2);
                 self.menu.as_mut().unwrap().hover = Some(1);
             }
+            Ok("themes") => self.open_bar_menu(3),
             Ok("about") => self.about = true,
             // Copy as a real key press would, then quit: the copy must survive.
             Ok("copy") => self.act(Action::CopyFile, 123_456_789),
@@ -935,7 +948,7 @@ impl App {
             }
             Ok("tree") => self.toggle_tree(),
             Ok("complete") => self.update_completion(),
-            Ok("bookmarks") => self.open_bar_menu(3),
+            Ok("bookmarks") => self.open_bar_menu(4),
             Ok("bookmark-add") => self.act(Action::AddBookmark, 0),
             Ok("export") => self.act(Action::ExportCsv, 0),
             Ok("export-now") => {
@@ -944,7 +957,7 @@ impl App {
                 eprintln!("{}", self.status);
                 return Ok(());
             }
-            Ok("options") => self.open_bar_menu(4),
+            Ok("options") => self.open_bar_menu(5),
             Ok("props") => self.act(Action::Properties, 0),
             Ok("select") => self.anchor = self.step(self.cursor, false, true),
             _ => {}
@@ -1763,7 +1776,7 @@ impl App {
         let (heading, rows) = match page {
             0 => (
                 "Interface",
-                vec![
+                [
                     Row::Check("Title bar with the application icon", Action::ToggleTitleBar),
                     Row::Gap,
                     Row::Pair("Zoom", format!("{:.0}%", self.scale * 100.0)),
@@ -1772,9 +1785,10 @@ impl App {
                     Row::Button("Reset to the desktop scale", Action::ZoomReset),
                     Row::Gap,
                     Row::Dim("Theme".into()),
-                    Row::Check("Follow the desktop", Action::Theme(0)),
-                    Row::Check("Light", Action::Theme(1)),
-                    Row::Check("Dark", Action::Theme(2)),
+                ]
+                .into_iter()
+                .chain(theme_choices().iter().map(|&(label, _, action)| Row::Check(label, action)))
+                .chain([
                     Row::Gap,
                     Row::Dim("Language".into()),
                     Row::Check("Follow the system", Action::Language(0)),
@@ -1782,7 +1796,8 @@ impl App {
                     Row::Check("Français", Action::Language(2)),
                     Row::Check("Español", Action::Language(3)),
                     Row::Check("Italiano", Action::Language(4)),
-                ],
+                ])
+                .collect(),
             ),
             1 => (
                 "Search",
@@ -2056,18 +2071,18 @@ impl App {
     /// Switches the palette to the chosen theme; "follow the desktop"
     /// asks the desktop whether it prefers dark.
     fn apply_theme(&mut self) {
-        // FF_GUI_THEME=light|dark pins it, for test pictures.
-        let pinned = std::env::var("FF_GUI_THEME").ok().and_then(|t| match t.as_str() {
-            "light" => Some(1),
-            "dark" => Some(2),
-            _ => None,
+        // FF_GUI_THEME=<first word of a theme's name> pins it, for test
+        // pictures: light, dark, graphite, ...
+        let pinned = std::env::var("FF_GUI_THEME").ok().and_then(|t| {
+            canvas::THEMES.iter().position(|th| th.name.split(' ').next().unwrap_or("").eq_ignore_ascii_case(&t))
         });
-        let dark = match pinned.unwrap_or(self.theme) {
-            1 => false,
-            2 => true,
-            _ => settings::desktop_prefers_dark(),
+        // Theme 0 follows the desktop (Light or Dark); n is THEMES[n - 1].
+        let index = match pinned {
+            Some(i) => i,
+            None if self.theme == 0 => settings::desktop_prefers_dark() as usize,
+            None => self.theme as usize - 1,
         };
-        canvas::set_dark(dark);
+        canvas::set_theme(index);
         // The accent colour chosen in Windows' personalization settings
         // (stored as 0xAABBGGRR).
         #[cfg(windows)]
@@ -2315,7 +2330,7 @@ impl App {
     }
 
     /// (x, width) of each menu-bar title.
-    fn bar_titles(&mut self) -> [(i32, i32); 6] {
+    fn bar_titles(&mut self) -> [(i32, i32); BAR.len()] {
         let mut x = 4 * self.u;
         BAR.map(|(title, _)| {
             let w = self.text.width(tr(title)) + 18 * self.u;
@@ -2365,7 +2380,11 @@ impl App {
             self.refresh_option_states();
         }
         let (x, _) = self.bar_titles()[i];
-        let items = if BAR[i].0 == "Bookmarks" { self.bookmark_menu() } else { BAR[i].1 };
+        let items = match BAR[i].0 {
+            "Bookmarks" => self.bookmark_menu(),
+            "Theme" => theme_choices(),
+            _ => BAR[i].1,
+        };
         self.menu = Some(Menu { x, y: self.menu_h(), hover: None, items, bar: Some(i) });
     }
 

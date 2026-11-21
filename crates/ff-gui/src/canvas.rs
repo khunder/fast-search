@@ -13,18 +13,29 @@ pub struct Canvas {
     pub clip: (i32, i32),
 }
 
-static DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static THEME: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Switches all drawing between the light and the dark palette.
-pub fn set_dark(dark: bool) {
-    DARK.store(dark, std::sync::atomic::Ordering::Relaxed);
+/// Switches all drawing to theme `THEMES[index]`.
+pub fn set_theme(index: usize) {
+    THEME.store(index.min(THEMES.len() - 1), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// White that stays white in both palettes: text on a coloured fill.
+/// True if the current theme is dark.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn is_dark() -> bool {
+    theme().dark
+}
+
+/// The theme drawing uses now.
+fn theme() -> &'static Theme {
+    &THEMES[THEME.load(std::sync::atomic::Ordering::Relaxed)]
+}
+
+/// White that stays white in every theme: text on a coloured fill.
 pub const ON_ACCENT: u32 = 0xff_fffe;
 
 /// The accent colour: the desktop's (Windows) or a blue, drawn a shade
-/// lighter in the dark palette. See [`set_accent`].
+/// lighter in dark themes. See [`set_accent`].
 pub const ACCENT: u32 = 0xff_fffd;
 
 static ACCENT_RGB: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x00_67c0);
@@ -35,9 +46,9 @@ pub fn set_accent(rgb: u32) {
     ACCENT_RGB.store(rgb & 0xff_ffff, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The light palette's surfaces and inks, each with the colour it takes in
-/// the dark palette (the Windows 11 ones). The light values must differ
-/// from any other colour drawn.
+/// The surfaces and inks every theme defines. Drawing code uses these
+/// values (those of the Light theme); [`tone`] turns them into the
+/// current theme's. They must differ from any other colour drawn.
 pub mod palette {
     /// The window behind everything (Windows' "Mica").
     pub const BASE: u32 = 0xf3f3f3;
@@ -56,26 +67,57 @@ pub mod palette {
     /// Scrollbar thumbs and other quiet controls.
     pub const QUIET: u32 = 0x8a8a8a;
 
-    pub(super) const DARK: [(u32, u32); 9] = [
-        (BASE, 0x202020),
-        (CARD, 0x272727),
-        (FIELD, 0x2d2d2d),
-        (STROKE, 0x3a3a3a),
-        (HOVER, 0x323232),
-        (PICKED, 0x383838),
-        (INK, 0xf3f3f3),
-        (DIM_INK, 0xababab),
-        (QUIET, 0x9a9a9a),
-    ];
+    /// In the order of [`super::Theme::colors`].
+    pub(super) const ALL: [u32; 9] = [BASE, CARD, FIELD, STROKE, HOVER, PICKED, INK, DIM_INK, QUIET];
 }
 
-/// The colour to really draw for a colour of the light palette. In the
-/// dark palette the named surfaces and inks of [`palette`] take their
-/// dark values; other greys are flipped (white paper becomes near-black,
-/// dark ink becomes light), pale tints become deep ones of the same hue,
-/// and strong colours stay as they are.
+/// A colour theme: its [`palette`] colours, and whether it is dark (other
+/// greys are then flipped and the accent lightened).
+pub struct Theme {
+    pub name: &'static str,
+    pub dark: bool,
+    /// Base, card, field, stroke, hover, picked, ink, dim ink, quiet.
+    colors: [u32; 9],
+}
+
+/// Every theme. Adding one is one entry here.
+pub const THEMES: [Theme; 6] = [
+    Theme { name: "Light", dark: false, colors: palette::ALL },
+    Theme {
+        name: "Dark",
+        dark: true,
+        colors: [0x202020, 0x272727, 0x2d2d2d, 0x3a3a3a, 0x323232, 0x383838, 0xf3f3f3, 0xababab, 0x9a9a9a],
+    },
+    Theme {
+        name: "Graphite (dark grey)",
+        dark: true,
+        colors: [0x2b2b2b, 0x333333, 0x3a3a3a, 0x494949, 0x3e3e3e, 0x464646, 0xeeeeee, 0xb2b2b2, 0xa2a2a2],
+    },
+    Theme {
+        name: "Mist (light grey)",
+        dark: false,
+        colors: [0xe3e5e8, 0xeef0f2, 0xf8f9fa, 0xd2d5da, 0xe1e4e8, 0xd7dbe0, 0x1d2126, 0x585e66, 0x878d95],
+    },
+    Theme {
+        name: "Dusk (blue-grey dark)",
+        dark: true,
+        colors: [0x1d2330, 0x242b39, 0x2b3343, 0x3a4458, 0x30394b, 0x39445a, 0xe5e9f1, 0xa2acbe, 0x8d98ac],
+    },
+    Theme {
+        name: "Sand (warm light)",
+        dark: false,
+        colors: [0xf1eadd, 0xf9f5ec, 0xfffcf5, 0xe2d7c3, 0xede4d4, 0xe6d9c2, 0x2b2419, 0x6a5e4b, 0x9a8d78],
+    },
+];
+
+/// The colour to really draw for a colour of the Light theme. The
+/// [`palette`] colours take the current theme's values. In a dark theme
+/// other greys are flipped (white paper becomes near-black, dark ink
+/// becomes light), pale tints become deep ones of the same hue, and
+/// strong colours stay as they are.
 pub fn tone(color: u32) -> u32 {
-    let dark = DARK.load(std::sync::atomic::Ordering::Relaxed);
+    let theme = theme();
+    let dark = theme.dark;
     if color == ON_ACCENT {
         return 0xff_ffff;
     }
@@ -89,11 +131,11 @@ pub fn tone(color: u32) -> u32 {
         let light = |c: u32| c + (255 - c) * 45 / 100;
         return light(r) << 16 | light(g) << 8 | light(b);
     }
+    if let Some(i) = palette::ALL.iter().position(|&c| c == color) {
+        return theme.colors[i];
+    }
     if !dark {
         return color;
-    }
-    if let Some(&(_, d)) = palette::DARK.iter().find(|p| p.0 == color) {
-        return d;
     }
     let [b, g, r] = bgr(color).map(|c| c as u32);
     let (max, min) = (r.max(g).max(b), r.min(g).min(b));

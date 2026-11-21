@@ -237,13 +237,13 @@ unsafe extern "system" {
     fn GetProcAddress(module: HANDLE, name: *const u8) -> *const c_void;
 }
 
-/// Gives a window a dark title bar when Windows is in dark mode, to
-/// match the dark palette the application then draws with. dwmapi is
+/// Gives a window a dark title bar when the theme is dark, to
+/// match the palette the application draws with. dwmapi is
 /// loaded at run time: the GNU toolchain ships no import library for it.
-fn match_title_bar(hwnd: HWND) {
+fn match_title_bar(hwnd: HWND, dark: bool) {
     const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
     type SetAttribute = unsafe extern "system" fn(HWND, u32, *const c_void, u32) -> i32;
-    let dark: BOOL = crate::settings::desktop_prefers_dark() as BOOL;
+    let dark = dark as BOOL;
     // SAFETY: a system library; the function has this signature.
     unsafe {
         let dwm = LoadLibraryW(wide("dwmapi.dll").as_ptr());
@@ -760,6 +760,8 @@ pub struct Win32 {
     class: Vec<u16>,
     instance: HANDLE,
     cursor: Cursor,
+    /// Whether the title bar was last made dark (it follows the theme).
+    title_dark: bool,
 }
 
 impl Win32 {
@@ -825,14 +827,14 @@ impl Win32 {
             for (kind, size) in [(1, 48), (0, 16 * (scale.round() as usize).max(1))] {
                 SendMessageW(main, WM_SETICON, kind, make_icon(size) as LPARAM);
             }
-            match_title_bar(main);
+            match_title_bar(main, crate::canvas::is_dark());
             ShowWindow(main, SW_SHOW);
             let size = client_size(main);
             with(|s| {
                 s.size = size;
                 s.events.push_back(Event::Resize(size.0.max(1), size.1.max(1)));
             });
-            Ok(Win32 { main, dialog: std::ptr::null_mut(), class, instance, cursor: Cursor::Arrow })
+            Ok(Win32 { main, dialog: std::ptr::null_mut(), class, instance, cursor: Cursor::Arrow, title_dark: crate::canvas::is_dark() })
         }
     }
 
@@ -922,6 +924,14 @@ impl Backend for Win32 {
         let hwnd = self.hwnd(win);
         if hwnd.is_null() || canvas.w == 0 || canvas.h == 0 {
             return Ok(());
+        }
+        // The theme may have changed: the title bars follow it.
+        let dark = crate::canvas::is_dark();
+        if dark != self.title_dark {
+            self.title_dark = dark;
+            for w in [self.main, self.dialog].into_iter().filter(|w| !w.is_null()) {
+                match_title_bar(w, dark);
+            }
         }
         let frame = Frame { w: canvas.w, h: canvas.h, px: canvas.px.clone() };
         // SAFETY: our window's device context, released after use.
@@ -1058,7 +1068,7 @@ impl Backend for Win32 {
             });
             // Modal: the main window takes no input while it is open.
             EnableWindow(self.main, 0);
-            match_title_bar(dialog);
+            match_title_bar(dialog, crate::canvas::is_dark());
             ShowWindow(dialog, SW_SHOW);
             SetForegroundWindow(dialog);
         }
