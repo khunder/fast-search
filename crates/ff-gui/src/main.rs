@@ -21,6 +21,8 @@ mod wayland;
 #[cfg(windows)]
 mod win32;
 #[cfg(windows)]
+mod win_tray;
+#[cfg(windows)]
 mod winsys;
 #[cfg(not(windows))]
 mod x11;
@@ -106,6 +108,8 @@ ENVIRONMENT:
 const FONT_PX: f32 = 14.5;
 /// Side of the resize grip in the bottom-right corner, in layout units.
 const GRIP: i32 = 16;
+/// The main window's title (on Windows also how a second start finds it).
+const WINDOW_TITLE: &str = "Fast search";
 /// Width of each window button (minimize, maximize, close) in our title
 /// bar, in layout units, as Windows draws them.
 const TITLE_BUTTON: i32 = 46;
@@ -233,12 +237,14 @@ enum Flag {
     SelectedInStatus,
     WildcardWholeName,
     MatchPath,
+    /// Closing hides the window to the notification area (Windows).
+    CloseToTray,
     /// The map of the selected folder beside the folder sizes tree.
     SizeMap,
 }
 
 /// Each option's name in the settings file and its default.
-const FLAGS: [(&str, bool); 12] = [
+const FLAGS: [(&str, bool); 13] = [
     ("hide_results_when_empty", false),
     ("close_on_open", false),
     ("path_double_click", true),
@@ -250,6 +256,7 @@ const FLAGS: [(&str, bool); 12] = [
     ("selected_in_status_bar", false),
     ("wildcards_whole_name", true),
     ("match_path", false),
+    ("close_to_tray", true),
     ("show_size_map", true),
 ];
 
@@ -618,6 +625,13 @@ fn run() -> ExitCode {
             _ => query.push(a),
         }
     }
+    // Already running (perhaps hidden in the notification area): show that
+    // window, which has the index loaded, instead of starting again. Test
+    // runs, which draw one frame and exit, always start their own.
+    #[cfg(windows)]
+    if std::env::var_os("FF_GUI_SNAPSHOT").is_none() && std::env::var_os("FF_GUI_TEST").is_none() && win_tray::wake_running(WINDOW_TITLE) {
+        return ExitCode::SUCCESS;
+    }
     let follow_default = db.is_none();
     let Some(db) = db.or_else(ff_core::default_db_path) else {
         eprintln!("ff-gui: HOME is not set; use --db");
@@ -736,7 +750,7 @@ impl App {
         // FF_GUI_SCALE beats the saved zoom, which beats the desktop scale.
         let env_scale = std::env::var("FF_GUI_SCALE").ok().and_then(|v| v.parse::<f32>().ok());
         let fixed = env_scale.or(config.scale).map(|s| s.clamp(0.5, 8.0));
-        let mut b = backend::connect(&WindowSpec { title: "Fast search", width: 1000, height: 640, scale: fixed })?;
+        let mut b = backend::connect(&WindowSpec { title: WINDOW_TITLE, width: 1000, height: 640, scale: fixed })?;
         let auto_scale = if env_scale.is_some() { env_scale.unwrap() } else { b.scale() };
         debug(format!("display: {} at scale {auto_scale}", b.name()));
         let scale = fixed.unwrap_or(auto_scale);
@@ -1079,7 +1093,18 @@ impl App {
                         dirty = true;
                     }
                 }
-                Event::Close(_) => return Ok(()),
+                Event::Close(_) => {
+                    if !self.dismiss() {
+                        return Ok(());
+                    }
+                }
+                Event::Quit => return Ok(()),
+                // Back from the notification area: typing replaces the
+                // last search.
+                Event::Shown => {
+                    self.act(Action::SelectAll, 0);
+                    dirty = true;
+                }
                 Event::Key { key, mods, .. } => {
                     if !self.key(key, mods)? {
                         return Ok(());
@@ -1706,9 +1731,9 @@ impl App {
                 self.status = format!("{} results selected: open at most 20 at a time", paths.len());
             }
             Action::Open if self.flag(Flag::CloseOnOpen) => {
-                // Open first, then close: nothing is left running to do it later.
+                // Open first, then close (or hide to the notification area).
                 paths.iter().for_each(|p| drop(desktop::open(p)));
-                self.quit = true;
+                self.quit = !self.dismiss();
             }
             Action::Open => {
                 self.status = if many { trf("Opening {} items", &[&paths.len()]) } else { trf("Opening {}", &[&path.display()]) };
@@ -1891,6 +1916,8 @@ impl App {
                     // What came of the last change, or why it was refused.
                     Row::Dim(self.status.clone()),
                     Row::Check("Show in the applications menu", Action::ToggleLauncher),
+                    #[cfg(windows)]
+                    Row::Check("Closing the window keeps it in the notification area", Action::Toggle(Flag::CloseToTray)),
                 ],
             ),
             5 => (
@@ -2315,6 +2342,15 @@ impl App {
         }
     }
 
+    /// Closes the window as the user asked (its close button, Alt+F4, Esc
+    /// on an empty search): on Windows it hides to the notification area,
+    /// to come back at once with the shortcut. True if it did; else the
+    /// program should exit.
+    fn dismiss(&mut self) -> bool {
+        self.menu = None;
+        self.flag(Flag::CloseToTray) && self.b.hide_to_tray()
+    }
+
     /// A left press on the title bar or window edge; true if handled.
     fn press_frame(&mut self, x: i32, y: i32, time: u32) -> bool {
         if !self.custom_title {
@@ -2324,7 +2360,7 @@ impl App {
             match button {
                 0 => self.b.minimize(),
                 1 => self.b.toggle_maximize(),
-                _ => self.quit = true,
+                _ => self.quit = !self.dismiss(),
             }
         } else if let Some(edge) = self.resize_edge(x, y) {
             self.b.start_resize(edge);
@@ -2617,7 +2653,7 @@ impl App {
             Key::Sym(K_END) if !ctrl => self.move_caret(self.query.len(), shift),
             Key::Sym(K_ESCAPE) => {
                 if self.query.is_empty() {
-                    return Ok(false);
+                    return Ok(self.dismiss());
                 }
                 self.clear_query();
             }

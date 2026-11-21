@@ -62,6 +62,11 @@ pub enum Event {
     DragFinished,
     /// The drag is over (after a drop, or released over nothing).
     DragEnded,
+    /// The main window was shown again, from the notification area or
+    /// by a second start of the program.
+    Shown,
+    /// Exit, chosen outside the window (the notification-area menu).
+    Quit,
     /// The desktop's scale for our window became known or changed.
     Scale(f32),
 }
@@ -85,6 +90,11 @@ pub trait Backend {
     /// Returns what is in effect: a desktop that draws no title bars
     /// leaves it to us whatever was asked.
     fn set_own_title_bar(&mut self, own: bool) -> bool;
+    /// Hides the main window to the notification area instead of closing
+    /// it, if the platform has one; false if it does not (then close).
+    fn hide_to_tray(&mut self) -> bool {
+        false
+    }
 
     /// True if the desktop gives the dialog window no title bar, so the
     /// dialog has to draw one.

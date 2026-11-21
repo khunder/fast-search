@@ -512,6 +512,10 @@ What differs from Linux:
   and it follows the Windows dark mode setting. Results can be dragged
   to Explorer and copied as files. The global shortcut is a hotkey on a
   Start-menu shortcut, so it needs Ctrl+Alt (default Ctrl+Alt+F).
+  Closing the window (its X, Alt+F4, or Esc on an empty search) hides it
+  to the notification area, index loaded: the shortcut, or starting
+  `ff-gui` again, shows it at once. *File → Quit*, Ctrl+Q or the tray
+  icon's *Exit* quit for real; *Options → Desktop* turns the hiding off.
 - **Live updates:** `ffd` watches each drive with `ReadDirectoryChangesW`
   and publishes `C:\ProgramData\ff\index.db`, which `ff` and `ff-gui` then
   use. Install it as a service from an administrator prompt (or from the

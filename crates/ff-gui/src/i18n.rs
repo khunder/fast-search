@@ -56,7 +56,7 @@ pub fn trf(template: &str, values: &[&dyn std::fmt::Display]) -> String {
 }
 
 /// English text and its [French, Spanish, Italian] translations.
-const TEXTS: [(&str, [&str; 3]); 310] = [
+const TEXTS: &[(&str, [&str; 3])] = &[
     ("File", ["Fichier", "Archivo", "File"]),
     ("Edit", ["Édition", "Editar", "Modifica"]),
     ("View", ["Affichage", "Ver", "Visualizza"]),
@@ -221,6 +221,9 @@ const TEXTS: [(&str, [&str; 3]); 310] = [
     ("To change it, type the keys, such as Ctrl+Alt+F, and press Enter:", ["Pour le changer, tapez les touches, par exemple Ctrl+Alt+F, puis Entrée :", "Para cambiarlo, escriba las teclas, por ejemplo Ctrl+Alt+F, y pulse Intro:", "Per cambiarla, digita i tasti, ad esempio Ctrl+Alt+F, e premi Invio:"]),
     ("{} now opens Fast search", ["{} ouvre maintenant Fast search", "{} ahora abre Fast search", "{} ora apre Fast search"]),
     ("Show in the applications menu", ["Afficher dans le menu des applications", "Mostrar en el menú de aplicaciones", "Mostra nel menu delle applicazioni"]),
+    ("Closing the window keeps it in the notification area", ["Fermer la fenêtre la garde dans la zone de notification", "Cerrar la ventana la mantiene en el área de notificación", "Chiudere la finestra la tiene nell'area di notifica"]),
+    ("Open Fast search", ["Ouvrir Fast search", "Abrir Fast search", "Apri Fast search"]),
+    ("Exit", ["Quitter", "Salir", "Esci"]),
     ("Keep the index current with the live updates service", ["Tenir l'index à jour avec le service de mise à jour en direct", "Mantener el índice actualizado con el servicio en vivo", "Mantieni l'indice aggiornato con il servizio in tempo reale"]),
     ("Switching it asks for your password. Everyone in your group can then", ["Le changer demande votre mot de passe. Tous les membres de votre groupe pourront", "Cambiarlo pide su contraseña. Todos los miembros de su grupo podrán", "Cambiarlo richiede la password. Tutti i membri del tuo gruppo potranno"]),
     ("search the names of all files on this computer.", ["rechercher les noms de tous les fichiers de cet ordinateur.", "buscar los nombres de todos los archivos de este equipo.", "cercare i nomi di tutti i file di questo computer."]),

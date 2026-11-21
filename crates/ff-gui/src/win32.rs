@@ -177,6 +177,7 @@ unsafe extern "system" {
     fn EnableWindow(hwnd: HWND, enable: BOOL) -> BOOL;
     fn SetForegroundWindow(hwnd: HWND) -> BOOL;
     fn IsZoomed(hwnd: HWND) -> BOOL;
+    fn IsIconic(hwnd: HWND) -> BOOL;
     fn GetSystemMetricsForDpi(index: i32, dpi: u32) -> i32;
     fn CreateIconIndirect(info: *const ICONINFO) -> HANDLE;
 }
@@ -281,6 +282,8 @@ const WM_MBUTTONUP: u32 = 0x0208;
 const WM_MOUSEWHEEL: u32 = 0x020A;
 const WM_DPICHANGED: u32 = 0x02E0;
 const WM_NCCALCSIZE: u32 = 0x0083;
+const WM_QUERYENDSESSION: u32 = 0x0011;
+const WM_ENDSESSION: u32 = 0x0016;
 
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
 const WS_POPUP: u32 = 0x8000_0000;
@@ -342,6 +345,8 @@ struct Shared {
     /// The main window draws its own title bar: Windows' caption is hidden
     /// (its resize borders, shadow and rounded corners stay).
     own_title: bool,
+    /// The notification-area icon is shown (after the first hide).
+    tray: bool,
     /// The program, not the desktop, chose the scale.
     fixed_scale: bool,
 }
@@ -420,8 +425,38 @@ fn blit(dc: HANDLE, frame: &Frame) {
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // SAFETY (for the calls below): `hwnd` is the window being served.
     let Some(win) = win_of(hwnd) else { return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) } };
+    // The notification-area icon: a click shows the window, a right
+    // click offers Open and Exit.
+    if win == Win::Main && msg == crate::win_tray::TRAY_MESSAGE {
+        const WM_LBUTTONUP: u32 = 0x202;
+        const WM_LBUTTONDBLCLK: u32 = 0x203;
+        const WM_RBUTTONUP: u32 = 0x205;
+        match lparam as u32 & 0xffff {
+            WM_LBUTTONUP | WM_LBUTTONDBLCLK => show_main(hwnd),
+            WM_RBUTTONUP => match crate::win_tray::menu(hwnd) {
+                Some(crate::win_tray::Choice::Open) => show_main(hwnd),
+                Some(crate::win_tray::Choice::Exit) => push(Event::Quit),
+                None => {}
+            },
+            _ => {}
+        }
+        return 0;
+    }
+    if win == Win::Main && msg == crate::win_tray::SHOW_MESSAGE {
+        show_main(hwnd);
+        return 0;
+    }
+    // Explorer restarted: its notification area is new and empty.
+    if win == Win::Main && with(|s| s.tray) && msg == crate::win_tray::taskbar_created() {
+        crate::win_tray::add(hwnd, tray_icon(hwnd));
+        return 0;
+    }
     match msg {
         WM_CLOSE => push(Event::Close(win)),
+        // Logging off, or an installer closing us to replace our files
+        // (Restart Manager): really exit, even when closing only hides.
+        WM_QUERYENDSESSION => return 1,
+        WM_ENDSESSION if win == Win::Main && wparam != 0 => push(Event::Quit),
         WM_DESTROY => {}
         WM_ERASEBKGND => return 1, // every pixel is painted by us
         // Our own title bar: the client area takes the caption's place.
@@ -763,8 +798,27 @@ fn release(object: *mut c_void) {
     }
 }
 
+
+/// Shows the main window again (from the notification area) in front.
+fn show_main(hwnd: HWND) {
+    const SW_SHOW: i32 = 5;
+    const SW_RESTORE: i32 = 9;
+    // SAFETY: our window.
+    unsafe {
+        ShowWindow(hwnd, if IsIconic(hwnd) != 0 { SW_RESTORE } else { SW_SHOW });
+        SetForegroundWindow(hwnd);
+    }
+    push(Event::Shown);
+}
+
+/// The application icon at the notification area's size for `hwnd`.
+fn tray_icon(hwnd: HWND) -> HANDLE {
+    // SAFETY: our window; SM_CXSMICON for its DPI.
+    let size = unsafe { GetSystemMetricsForDpi(49, GetDpiForWindow(hwnd).max(96)) };
+    make_icon(size.max(16) as usize)
+}
 /// Makes a window icon from the application's drawn icon.
-fn make_icon(size: usize) -> HANDLE {
+pub(crate) fn make_icon(size: usize) -> HANDLE {
     let pixels: Vec<u8> = Icon::App.render(size).into_iter().flatten().collect();
     let mask = vec![0u8; size.div_ceil(16) * 2 * size];
     // SAFETY: buffers of the sizes the bitmaps are made with.
@@ -797,7 +851,7 @@ impl Win32 {
             SetProcessDpiAwarenessContext(-4);
             OleInitialize(std::ptr::null_mut());
             let instance = GetModuleHandleW(std::ptr::null());
-            let class = wide("ff-gui");
+            let class = wide(crate::win_tray::CLASS);
             let arrow = LoadCursorW(std::ptr::null_mut(), 32512 as *const u16);
             let wc = WNDCLASSEXW {
                 cbSize: size_of::<WNDCLASSEXW>() as u32,
@@ -904,6 +958,9 @@ impl Win32 {
 impl Drop for Win32 {
     fn drop(&mut self) {
         self.close_dialog();
+        if with(|s| s.tray) {
+            crate::win_tray::remove(self.main);
+        }
         with(|s| s.main = 0);
         // SAFETY: our window, destroyed once.
         unsafe { DestroyWindow(self.main) };
@@ -980,6 +1037,17 @@ impl Backend for Win32 {
         // SAFETY: our window.
         unsafe { SetWindowPos(self.main, std::ptr::null_mut(), 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED) };
         own
+    }
+
+    fn hide_to_tray(&mut self) -> bool {
+        const SW_HIDE: i32 = 0;
+        if !with(|s| std::mem::replace(&mut s.tray, true)) {
+            crate::win_tray::add(self.main, tray_icon(self.main));
+        }
+        self.close_dialog();
+        // SAFETY: our window.
+        unsafe { ShowWindow(self.main, SW_HIDE) };
+        true
     }
 
     fn dialog_needs_title_bar(&self) -> bool {
