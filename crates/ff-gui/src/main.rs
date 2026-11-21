@@ -9,6 +9,8 @@ mod canvas;
 mod complete;
 mod debug;
 mod dialog;
+#[cfg(windows)]
+mod gdi_text;
 mod i18n;
 mod keys;
 mod saved;
@@ -35,7 +37,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
-use canvas::{Canvas, Icon, Icons, ON_ACCENT, Text};
+use canvas::{Canvas, Icon, Icons, ON_ACCENT, Text, palette};
 use ff_core::{BuildOptions, CaseMode, Index, Kind, Query, SearchOptions, Sort, desktop, group_digits};
 use dialog::{Dialog, NavItem, Row};
 use i18n::{tr, trf};
@@ -104,13 +106,14 @@ const FONT_PX: f32 = 14.5;
 /// Side of the resize grip in the bottom-right corner, in layout units.
 const GRIP: i32 = 16;
 
-const WHITE: u32 = 0xffffff;
-const PANEL: u32 = 0xf2f2f2;
-const LINE: u32 = 0xd0d0d0;
-const TEXT: u32 = 0x1f1f1f;
-const DIM: u32 = 0x666666;
-const SELECT: u32 = 0x1a66c9;
-const HOVER: u32 = 0xdbe9fa;
+// The Windows 11 (Fluent) palette, light values; see `canvas::palette`.
+const WHITE: u32 = palette::FIELD;
+const PANEL: u32 = palette::BASE;
+const LINE: u32 = palette::STROKE;
+const TEXT: u32 = palette::INK;
+const DIM: u32 = palette::DIM_INK;
+const SELECT: u32 = canvas::ACCENT;
+const HOVER: u32 = palette::HOVER;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Action {
@@ -2053,12 +2056,24 @@ impl App {
     /// Switches the palette to the chosen theme; "follow the desktop"
     /// asks the desktop whether it prefers dark.
     fn apply_theme(&mut self) {
-        let dark = match self.theme {
+        // FF_GUI_THEME=light|dark pins it, for test pictures.
+        let pinned = std::env::var("FF_GUI_THEME").ok().and_then(|t| match t.as_str() {
+            "light" => Some(1),
+            "dark" => Some(2),
+            _ => None,
+        });
+        let dark = match pinned.unwrap_or(self.theme) {
             1 => false,
             2 => true,
             _ => settings::desktop_prefers_dark(),
         };
         canvas::set_dark(dark);
+        // The accent colour chosen in Windows' personalization settings
+        // (stored as 0xAABBGGRR).
+        #[cfg(windows)]
+        if let Some(abgr) = winsys::reg_dword(winsys::HKEY_CURRENT_USER, r"Software\Microsoft\Windows\DWM", "AccentColor") {
+            canvas::set_accent((abgr & 0xff) << 16 | (abgr & 0xff00) | (abgr >> 16 & 0xff));
+        }
     }
 
     /// The line on the index pages saying how their changes are saved.
@@ -2861,26 +2876,31 @@ impl App {
         let (u, row_h, bar) = (self.u, self.row_h(), self.bar_w());
         let pad = 8 * u;
         let cols = self.columns();
-        self.cv.fill(0, 0, w, h, WHITE);
+        // The window base, with the results list as a lighter layer on it.
+        self.cv.fill(0, 0, w, h, PANEL);
+        self.cv.fill(0, self.box_h(), w, h - self.box_h() - row_h, palette::CARD);
+        self.cv.fill(0, self.box_h(), w, 1, LINE);
 
-        // Search box: text scrolled to keep the caret visible, selection
-        // highlighted, all clipped to the inside of the box.
+        // Search box (a Windows 11 text box: rounded, a hairline border,
+        // and an accent line along the bottom while it has the focus):
+        // text scrolled to keep the caret visible, selection highlighted,
+        // all clipped to the inside of the box.
         let top = self.menu_h();
-        self.cv.fill(0, top, w, self.box_h() - top, PANEL);
-        self.cv.fill(6 * u, top + 6 * u, w - 12 * u, row_h + 2 * u, WHITE);
-        self.cv.frame(6 * u, top + 6 * u, w - 12 * u, row_h + 2 * u, u.max(1), 0x8fb4e8);
+        let (bx, by, bw, bh) = (6 * u, top + 6 * u, w - 12 * u, row_h + 2 * u);
+        self.cv.round_frame(bx, by, bw, bh, 4 * u, u.max(1), LINE, WHITE);
+        self.cv.clip = (bx + 3 * u, bx + bw - 3 * u);
+        self.cv.fill(bx, by + bh - 2 * u, bw, 2 * u, SELECT);
+        self.cv.clip = (0, i32::MAX);
 
         // Title bar (ours) and menu bar.
         let th = self.title_h();
         if self.custom_title {
             self.draw_title_bar();
         }
-        self.cv.fill(0, th, w, top - th, WHITE);
-        self.cv.fill(0, top - 1, w, 1, LINE);
         let open = self.menu.as_ref().and_then(|m| m.bar);
         for (i, (x, tw)) in self.bar_titles().into_iter().enumerate() {
             if open == Some(i) {
-                self.cv.fill(x, th, tw, top - 1 - th, HOVER);
+                self.cv.round(x + 2 * u, th + 2 * u, tw - 4 * u, top - th - 4 * u, 4 * u, palette::PICKED);
             }
             self.text.draw(&mut self.cv, x + 9 * u, th + 3 * u, tr(BAR[i].0), tw, TEXT);
         }
@@ -2888,9 +2908,9 @@ impl App {
             let (y, bh) = (th + 2 * u, top - th - 5 * u);
             let on = self.checked(action);
             if on {
-                self.cv.fill(x, y, bw, bh, SELECT);
+                self.cv.round(x, y, bw, bh, 4 * u, SELECT);
             } else {
-                self.cv.frame(x, y, bw, bh, u.max(1), LINE);
+                self.cv.round_frame(x, y, bw, bh, 4 * u, u.max(1), LINE, WHITE);
             }
             let ty = y + (bh - self.text.height) / 2;
             self.text.draw(&mut self.cv, x + 10 * u, ty, tr(label), bw, if on { ON_ACCENT } else { TEXT });
@@ -2918,17 +2938,18 @@ impl App {
             self.cv.fill(tx + caret, ty, u.max(1), self.text.height, TEXT);
             self.cv.clip = (0, i32::MAX);
 
-            // Column headers with the sort direction.
+            // Column headers with the sort direction, quiet, on the list.
             let y = self.box_h();
-            self.cv.fill(0, y, w, row_h, PANEL);
-            self.cv.fill(0, y + row_h, w, 1, LINE);
+            self.cv.fill(pad, y + row_h, w - 2 * pad, 1, LINE);
             let heads = [("Name", Sort::Name), ("Path", Sort::Path), ("Size", Sort::Size), ("Modified", Sort::Mtime)];
             for (i, ((label, sort), (x, cw))) in heads.into_iter().zip(cols).enumerate() {
                 let mark = if self.sort != sort { "" } else if self.reverse { "  ▼" } else { "  ▲" };
                 if i > 0 {
-                    self.cv.fill(x, y + 4 * u, 1, row_h - 8 * u, LINE);
+                    self.cv.fill(x, y + 6 * u, 1, row_h - 12 * u, LINE);
                 }
-                self.text.draw(&mut self.cv, x + pad, y + 3 * u, &format!("{}{mark}", tr(label)), cw - 2 * pad, TEXT);
+                let ink = if self.sort == sort { TEXT } else { DIM };
+                let lead = if i == 0 { 6 * u } else { 0 };
+                self.text.draw(&mut self.cv, x + pad + lead, y + 3 * u, &format!("{}{mark}", tr(label)), cw - 2 * pad, ink);
             }
 
             // Result rows.
@@ -2940,13 +2961,19 @@ impl App {
                 let Some(&id) = self.hits.get(self.top + row) else { break };
                 let y = list_top + row as i32 * row_h;
                 let selected = self.is_selected(self.top + row);
-                let (fg, dim) = if selected { (ON_ACCENT, ON_ACCENT) } else { (TEXT, DIM) };
+                let (fg, dim) = (TEXT, DIM);
+                // Windows 11 list rows: a rounded, inset highlight; the
+                // current row also gets the accent mark on its left.
+                let (rx, rw) = (4 * u, w - bar - 6 * u);
                 if selected {
-                    self.cv.fill(0, y, w - bar, row_h, SELECT);
+                    self.cv.round(rx, y + u, rw, row_h - 2 * u, 4 * u, palette::PICKED);
+                    if self.top + row == self.sel {
+                        self.cv.round(rx, y + row_h / 2 - 8 * u, 3 * u, 16 * u, 2 * u, SELECT);
+                    }
                 } else if self.hover_row == Some(self.top + row) {
-                    self.cv.fill(0, y, w - bar, row_h, 0xe6f0fc);
+                    self.cv.round(rx, y + u, rw, row_h - 2 * u, 4 * u, HOVER);
                 } else if self.flag(Flag::AltRows) && (self.top + row) % 2 == 1 {
-                    self.cv.fill(0, y, w - bar, row_h, 0xf5f7f9);
+                    self.cv.fill(0, y, w - bar, row_h, 0xf6f6f6);
                 }
                 let is_dir = self.index.is_dir(id);
                 let name = String::from_utf8_lossy(self.index.name(id)).into_owned();
@@ -2958,9 +2985,9 @@ impl App {
                     None => String::new(),
                 };
                 let kind = Icon::of(self.index.name(id), is_dir, self.index.is_symlink(id));
-                self.icons.draw(&mut self.cv, cols[0].0 + pad, y + (row_h - icon) / 2, kind);
+                self.icons.draw(&mut self.cv, cols[0].0 + pad + 6 * u, y + (row_h - icon) / 2, kind);
                 let ty = y + 3 * u;
-                let name_x = cols[0].0 + pad + icon + 6 * u;
+                let name_x = cols[0].0 + pad + 6 * u + icon + 6 * u; // room for the accent mark
                 self.text.draw(&mut self.cv, name_x, ty, &name, cols[0].0 + cols[0].1 - pad - name_x, fg);
                 self.text.draw(&mut self.cv, cols[1].0 + pad, ty, &parent, cols[1].1 - 2 * pad, dim);
                 if !is_dir {
@@ -2977,8 +3004,9 @@ impl App {
             if self.hits.len() > rows {
                 let (track, thumb) = self.scrollbar();
                 let pos = ((track - thumb) as i64 * self.top as i64 / self.max_top().max(1) as i64) as i32;
-                self.cv.fill(w - bar, list_top, bar, track, PANEL);
-                self.cv.fill(w - bar + 2 * u, list_top + pos, bar - 4 * u, thumb, 0xa6a6a6);
+                // A thin rounded thumb, as Windows 11 draws scrollbars.
+                let tw = 4 * u;
+                self.cv.round(w - bar + (bar - tw) / 2, list_top + pos + 2 * u, tw, thumb - 4 * u, tw / 2, palette::QUIET);
             }
         }
 
@@ -3108,15 +3136,15 @@ impl App {
     fn draw_menu(&mut self, menu: &Menu) {
         let (u, row_h) = (self.u, self.row_h());
         let (x, y, w, h) = self.menu_rect(menu);
-        self.cv.fill(x + 3 * u, y + 3 * u, w, h, 0xbdbdbd); // shadow
-        self.cv.fill(x, y, w, h, WHITE);
-        self.cv.frame(x, y, w, h, u.max(1), 0x9a9a9a);
+        // A Windows 11 flyout: rounded, a hairline border, a soft shadow.
+        self.cv.round(x + u, y + 2 * u, w, h, 8 * u, 0xd6d6d6);
+        self.cv.round_frame(x, y, w, h, 8 * u, u.max(1), 0xd0d0d0, WHITE);
         for (i, (label, shortcut, action)) in menu.items.iter().enumerate() {
             let iy = y + 4 * u + i as i32 * row_h;
             // Entries the user has no permission for are greyed.
             let off = self.refusal(*action).is_some();
             if menu.hover == Some(i) && !off {
-                self.cv.fill(x + u, iy, w - 2 * u, row_h, HOVER);
+                self.cv.round(x + 4 * u, iy + u, w - 8 * u, row_h - 2 * u, 4 * u, HOVER);
             }
             // A bullet marks active choices and switched-on options.
             if self.checked(*action) {

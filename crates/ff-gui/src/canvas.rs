@@ -1,6 +1,7 @@
 //! Client-side drawing: a pixel buffer, anti-aliased text and file icons.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(not(windows))]
 use std::io;
 
 /// The window content as 32-bit BGRX pixels, ready to send to the X server.
@@ -22,16 +23,77 @@ pub fn set_dark(dark: bool) {
 /// White that stays white in both palettes: text on a coloured fill.
 pub const ON_ACCENT: u32 = 0xff_fffe;
 
+/// The accent colour: the desktop's (Windows) or a blue, drawn a shade
+/// lighter in the dark palette. See [`set_accent`].
+pub const ACCENT: u32 = 0xff_fffd;
+
+static ACCENT_RGB: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x00_67c0);
+
+/// Sets the colour [`ACCENT`] stands for (on Windows, the desktop's).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn set_accent(rgb: u32) {
+    ACCENT_RGB.store(rgb & 0xff_ffff, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The light palette's surfaces and inks, each with the colour it takes in
+/// the dark palette (the Windows 11 ones). The light values must differ
+/// from any other colour drawn.
+pub mod palette {
+    /// The window behind everything (Windows' "Mica").
+    pub const BASE: u32 = 0xf3f3f3;
+    /// The results list, a layer above the base.
+    pub const CARD: u32 = 0xfbfbfb;
+    /// Text boxes, menus and dialogs.
+    pub const FIELD: u32 = 0xffffff;
+    /// Hairlines and borders.
+    pub const STROKE: u32 = 0xe5e5e5;
+    /// A row or item under the pointer.
+    pub const HOVER: u32 = 0xf0f0f0;
+    /// A selected row.
+    pub const PICKED: u32 = 0xe9e9e9;
+    pub const INK: u32 = 0x1b1b1b;
+    pub const DIM_INK: u32 = 0x616161;
+    /// Scrollbar thumbs and other quiet controls.
+    pub const QUIET: u32 = 0x8a8a8a;
+
+    pub(super) const DARK: [(u32, u32); 9] = [
+        (BASE, 0x202020),
+        (CARD, 0x272727),
+        (FIELD, 0x2d2d2d),
+        (STROKE, 0x3a3a3a),
+        (HOVER, 0x323232),
+        (PICKED, 0x383838),
+        (INK, 0xf3f3f3),
+        (DIM_INK, 0xababab),
+        (QUIET, 0x9a9a9a),
+    ];
+}
+
 /// The colour to really draw for a colour of the light palette. In the
-/// dark palette greys are flipped (white paper becomes near-black, dark
-/// ink becomes light), pale tints become deep ones of the same hue, and
-/// strong colours such as the selection blue stay as they are.
+/// dark palette the named surfaces and inks of [`palette`] take their
+/// dark values; other greys are flipped (white paper becomes near-black,
+/// dark ink becomes light), pale tints become deep ones of the same hue,
+/// and strong colours stay as they are.
 pub fn tone(color: u32) -> u32 {
+    let dark = DARK.load(std::sync::atomic::Ordering::Relaxed);
     if color == ON_ACCENT {
         return 0xff_ffff;
     }
-    if !DARK.load(std::sync::atomic::Ordering::Relaxed) {
+    if color == ACCENT {
+        let rgb = ACCENT_RGB.load(std::sync::atomic::Ordering::Relaxed);
+        if !dark {
+            return rgb;
+        }
+        // Windows uses a lighter accent on dark: mix 45% white in.
+        let [b, g, r] = bgr(rgb).map(|c| c as u32);
+        let light = |c: u32| c + (255 - c) * 45 / 100;
+        return light(r) << 16 | light(g) << 8 | light(b);
+    }
+    if !dark {
         return color;
+    }
+    if let Some(&(_, d)) = palette::DARK.iter().find(|p| p.0 == color) {
+        return d;
     }
     let [b, g, r] = bgr(color).map(|c| c as u32);
     let (max, min) = (r.max(g).max(b), r.min(g).min(b));
@@ -78,6 +140,43 @@ impl Canvas {
         }
     }
 
+    /// Fills a rectangle with corners rounded to radius `r`, anti-aliased.
+    pub fn round(&mut self, x: i32, y: i32, w: i32, h: i32, r: i32, color: u32) {
+        let r = r.min(w / 2).min(h / 2).max(0);
+        if r == 0 {
+            return self.fill(x, y, w, h, color);
+        }
+        self.fill(x, y + r, w, h - 2 * r, color);
+        self.fill(x + r, y, w - 2 * r, r, color);
+        self.fill(x + r, y + h - r, w - 2 * r, r, color);
+        let c = bgr(tone(color));
+        let rf = r as f32;
+        // The four corners: coverage from 4x4 samples per pixel.
+        for dy in 0..r {
+            for dx in 0..r {
+                let mut inside = 0;
+                for s in 0..16 {
+                    let px = dx as f32 + (s % 4) as f32 * 0.25 + 0.125;
+                    let py = dy as f32 + (s / 4) as f32 * 0.25 + 0.125;
+                    let (ex, ey) = (rf - px, rf - py);
+                    inside += (ex <= 0.0 || ey <= 0.0 || ex * ex + ey * ey <= rf * rf) as u32;
+                }
+                let a = inside * 255 / 16;
+                self.blend(x + dx, y + dy, c, a);
+                self.blend(x + w - 1 - dx, y + dy, c, a);
+                self.blend(x + dx, y + h - 1 - dy, c, a);
+                self.blend(x + w - 1 - dx, y + h - 1 - dy, c, a);
+            }
+        }
+    }
+
+    /// A rounded outline `t` thick, drawn as a rounded fill of `color`
+    /// with a rounded fill of `inside` on top.
+    pub fn round_frame(&mut self, x: i32, y: i32, w: i32, h: i32, r: i32, t: i32, color: u32, inside: u32) {
+        self.round(x, y, w, h, r, color);
+        self.round(x + t, y + t, w - 2 * t, h - 2 * t, (r - t).max(0), inside);
+    }
+
     /// A 1-`t`-thick rectangle outline.
     pub fn frame(&mut self, x: i32, y: i32, w: i32, h: i32, t: i32, color: u32) {
         self.fill(x, y, w, t, color);
@@ -99,6 +198,18 @@ impl Canvas {
         }
     }
 }
+
+/// Windows draws text with GDI (`gdi_text.rs`); elsewhere text is drawn
+/// from the font outlines here.
+#[cfg(windows)]
+pub use crate::gdi_text::Text;
+#[cfg(not(windows))]
+pub use ttf_text::Text;
+
+#[cfg(not(windows))]
+mod ttf_text {
+use super::*;
+use std::collections::HashSet;
 
 struct Glyph {
     advance: f32,
@@ -251,37 +362,12 @@ pub struct Text {
     pub height: i32,
 }
 
-#[cfg(not(windows))]
 fn fc_match(pattern: &str) -> Option<String> {
     let out = std::process::Command::new("fc-match").args(["-f", "%{file}", pattern]).output().ok()?;
     let file = String::from_utf8(out.stdout).ok()?;
     (!file.is_empty()).then_some(file)
 }
 
-/// The Windows fonts folder.
-#[cfg(windows)]
-fn fonts_dir() -> std::path::PathBuf {
-    let windir = std::env::var_os("WINDIR").or_else(|| std::env::var_os("SystemRoot")).unwrap_or_else(|| "C:\\Windows".into());
-    std::path::PathBuf::from(windir).join("Fonts")
-}
-
-/// Windows has no fontconfig. The default face comes from the fixed
-/// list in `Text::load`; for a character missing there, the first font
-/// of a list of wide-coverage system fonts that has it.
-#[cfg(windows)]
-fn fc_match(pattern: &str) -> Option<String> {
-    let ch = char::from_u32(u32::from_str_radix(pattern.strip_prefix(":charset=")?, 16).ok()?)?;
-    let fallbacks = [
-        "seguisym.ttf", "seguiemj.ttf", "msyh.ttc", "YuGothR.ttc", "malgun.ttf", "Nirmala.ttc", "Nirmala.ttf",
-        "seguihis.ttf", "ebrima.ttf", "tahoma.ttf", "arial.ttf", "simsun.ttc",
-    ];
-    fallbacks.iter().map(|f| fonts_dir().join(f)).filter(|p| p.exists()).find_map(|path| {
-        let data = std::fs::read(&path).ok()?;
-        let face = ttf_parser::Face::parse(&data, 0).ok()?;
-        face.glyph_index(ch)?;
-        path.to_str().map(String::from)
-    })
-}
 
 fn load_font(path: &str) -> Option<Face> {
     // Fonts stay loaded for the life of the program.
@@ -317,11 +403,6 @@ impl Text {
     pub fn load(px: f32) -> io::Result<Text> {
         let mut candidates: Vec<String> = std::env::var("FF_GUI_FONT").into_iter().collect();
         candidates.extend(fc_match("sans"));
-        #[cfg(windows)]
-        candidates.extend(
-            ["segoeui.ttf", "SegUIVar.ttf", "arial.ttf", "tahoma.ttf", "verdana.ttf"]
-                .map(|f| fonts_dir().join(f).to_string_lossy().into_owned()),
-        );
         candidates.extend(
             [
                 "/usr/share/fonts/truetype/DejaVuSans.ttf",
@@ -429,6 +510,7 @@ impl Text {
             }
         }
     }
+}
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
