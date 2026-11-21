@@ -322,18 +322,28 @@ pub fn read_exact_at(file: &fs::File, buf: &mut [u8], offset: u64) -> std::io::R
     {
         use std::os::windows::fs::FileExt;
         const BLOCK: u64 = 4096;
+        let fill = |buf: &mut [u8], start: u64| -> std::io::Result<usize> {
+            let mut done = 0;
+            while done < buf.len() {
+                match file.seek_read(&mut buf[done..], start + done as u64) {
+                    Ok(0) => break,
+                    Ok(n) => done += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(done)
+        };
+        // Whole blocks (the big reads of a master file table) go straight
+        // into the caller's buffer.
+        if offset % BLOCK == 0 && buf.len() as u64 % BLOCK == 0 {
+            let len = buf.len();
+            return if fill(buf, offset)? == len { Ok(()) } else { Err(std::io::ErrorKind::UnexpectedEof.into()) };
+        }
         let start = offset / BLOCK * BLOCK;
         let end = (offset + buf.len() as u64).div_ceil(BLOCK) * BLOCK;
         let mut tmp = vec![0u8; (end - start) as usize];
-        let mut done = 0;
-        while done < tmp.len() {
-            match file.seek_read(&mut tmp[done..], start + done as u64) {
-                Ok(0) => break,
-                Ok(n) => done += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        }
+        let done = fill(&mut tmp, start)?;
         let skip = (offset - start) as usize;
         if done < skip + buf.len() {
             return Err(std::io::ErrorKind::UnexpectedEof.into());

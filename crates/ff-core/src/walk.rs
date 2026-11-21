@@ -89,11 +89,22 @@ impl Index {
         }
 
         let mut index = Index::new();
-        index.excludes = opts
+        let mut excludes: Vec<Vec<u8>> = opts
             .excludes
             .iter()
             .map(|e| crate::os::path_bytes(&crate::os::canonicalize(e).unwrap_or_else(|_| e.clone())).to_vec())
             .collect();
+        if opts.skip_hidden {
+            excludes.push(HIDDEN_MARK.to_vec());
+        }
+
+        // NTFS volumes are read from their master file table when we may
+        // (as administrator); only what is left is walked.
+        #[cfg(windows)]
+        let kept = {
+            let prune = crate::rawfs::Prune { excludes: &excludes, skip_hidden: opts.skip_hidden };
+            crate::rawfs::index_volumes(kept, &mut index, &prune, progress)
+        };
 
         let mut stack = Vec::new();
         for r in kept {
@@ -106,10 +117,6 @@ impl Index {
             0 => thread::available_parallelism().map_or(4, |n| n.get()).min(16),
             n => n,
         };
-        if opts.skip_hidden {
-            index.excludes.push(HIDDEN_MARK.to_vec());
-        }
-        let excludes = std::mem::take(&mut index.excludes);
         let index = Mutex::new(index);
         let queue = (Mutex::new(Queue { stack, active: 0 }), Condvar::new());
         thread::scope(|s| {
