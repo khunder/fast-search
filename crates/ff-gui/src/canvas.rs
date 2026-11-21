@@ -491,28 +491,7 @@ impl Icon {
             u >= x0 && u <= x1 && v >= y0 && v <= y1 && dx * dx + dy * dy <= r * r
         };
         if self == Icon::App {
-            // An almond: the overlap of two circles, one centred below
-            // and one above the middle. `r` shrinks it for the outline.
-            let almond = |r: f32| {
-                let dx2 = (u - 0.5).powi(2);
-                dx2 + (v - 0.74).powi(2) <= r * r && dx2 + (v - 0.26).powi(2) <= r * r
-            };
-            if !almond(0.51) {
-                return None;
-            }
-            if !almond(0.455) {
-                return Some(0xf08a1c); // eyelid outline
-            }
-            let from = |cx: f32, cy: f32| ((u - cx).powi(2) + (v - cy).powi(2)).sqrt();
-            return Some(if from(0.555, 0.445) <= 0.035 {
-                0xffffff // glint
-            } else if from(0.5, 0.5) <= 0.085 {
-                0x2b2118 // pupil
-            } else if from(0.5, 0.5) <= 0.17 {
-                0xc96a12 // iris
-            } else {
-                0xfdfdfd
-            });
+            return crate::app_icon::sample(u, v);
         }
         if self == Icon::Folder {
             return if rounded(0.05, 0.27, 0.95, 0.87, 0.07) {
@@ -562,25 +541,7 @@ impl Icon {
 impl Icon {
     /// Renders the icon as `size` x `size` BGRA pixels.
     pub fn render(self, size: usize) -> Vec<[u8; 4]> {
-        // 4x4 supersampling gives smooth edges.
-        const N: usize = 4;
-        let step = 1.0 / (size * N) as f32;
-        (0..size * size)
-            .map(|i| {
-                let (px, py) = (i % size, i / size);
-                let mut sum = [0u32; 4];
-                for s in 0..N * N {
-                    let u = ((px * N + s % N) as f32 + 0.5) * step;
-                    let v = ((py * N + s / N) as f32 + 0.5) * step;
-                    if let Some(c) = self.sample(u, v) {
-                        let [b, g, r] = bgr(c);
-                        sum = [sum[0] + b as u32, sum[1] + g as u32, sum[2] + r as u32, sum[3] + 1];
-                    }
-                }
-                let n = sum[3].max(1);
-                [(sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8, (sum[3] * 255 / (N * N) as u32) as u8]
-            })
-            .collect()
+        crate::app_icon::render(size, |u, v| self.sample(u, v))
     }
 }
 

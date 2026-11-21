@@ -17,6 +17,7 @@ USAGE:
   ff -i                         search interactively in the terminal
   ff index [ROOT...] [-x DIR]   build or rebuild the index
   ff stats                      show index information
+  ff update                     install the newest release (Windows)
 
 TERMS:
   foo        name contains \"foo\" (case-insensitive unless it has uppercase)
@@ -128,7 +129,7 @@ fn run() -> Result<ExitCode, String> {
                 return Ok(ExitCode::SUCCESS);
             }
             "-V" | "--version" => {
-                println!("ff {}", env!("CARGO_PKG_VERSION"));
+                println!("ff {}", ff_core::update::VERSION);
                 return Ok(ExitCode::SUCCESS);
             }
             "-f" | "--files" => a.kind = Kind::File,
@@ -180,6 +181,7 @@ fn run() -> Result<ExitCode, String> {
     match a.free.first().and_then(|f| f.to_str()).filter(|_| !only_free) {
         Some("index") => cmd_index(&a, &db),
         Some("stats") => cmd_stats(&db),
+        Some("update") => cmd_update(),
         Some("help") => {
             print!("{USAGE}");
             Ok(ExitCode::SUCCESS)
@@ -351,4 +353,25 @@ fn print_hits(a: &Args, index: &Index, hits: &[u32]) -> io::Result<()> {
         out.write_all(if a.null { b"\0" } else { b"\n" })?;
     }
     out.flush()
+}
+
+/// `ff update`: installs the newest release over this one (Windows), or
+/// says whether there is one (elsewhere, packages update the programs).
+fn cmd_update() -> Result<ExitCode, String> {
+    #[cfg(windows)]
+    {
+        let done = ff_core::update::update(false, |step| eprintln!("{step}")).map_err(|e| e.to_string())?;
+        eprintln!("{done}");
+    }
+    #[cfg(not(windows))]
+    {
+        let release = ff_core::update::latest().map_err(|e| e.to_string())?;
+        if release.is_newer() {
+            eprintln!("Fast search {} is available: {}", release.version(), release.page());
+            eprintln!("update it with your package manager, or download the new package there");
+        } else {
+            eprintln!("Fast search is up to date ({})", ff_core::update::VERSION);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }

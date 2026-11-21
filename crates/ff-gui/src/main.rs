@@ -3,6 +3,7 @@
 // On Windows, a window program: no console window opens with it.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod app_icon;
 mod backend;
 mod canvas;
 mod complete;
@@ -181,6 +182,8 @@ enum Action {
     ExportCsv,
     ConfirmExport,
     About,
+    /// Install the newest release, if there is one.
+    Update,
     Quit,
     ZoomIn,
     ZoomOut,
@@ -332,6 +335,7 @@ const BAR: [(&str, Items); 6] = [
             ("Search syntax", "F1", Action::Help(0)),
             ("Filters", "", Action::Help(1)),
             ("Keyboard shortcuts", "", Action::Help(2)),
+            ("Check for updates", "", Action::Update),
             ("About Fast search", "", Action::About),
         ],
     ),
@@ -496,8 +500,19 @@ fn run() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "-V" | "--version" => {
-                println!("ff-gui {}", env!("CARGO_PKG_VERSION"));
+                println!("ff-gui {}", ff_core::update::VERSION);
                 return ExitCode::SUCCESS;
+            }
+            // For packaging: the icon as an .ico file (the Windows installer uses it).
+            "--write-icon" => {
+                let Some(file) = args.next() else { return ExitCode::from(2) };
+                return match std::fs::write(&file, app_icon::ico()) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("ff-gui: {file}: {e}");
+                        ExitCode::FAILURE
+                    }
+                };
             }
             "--db" => db = args.next().map(PathBuf::from),
             "--shortcut" => {
@@ -1610,6 +1625,23 @@ impl App {
                 self.status = tr("Waiting for authorization...").into();
                 let (install, tx) = (!settings::daemon_installed(), self.notice_tx.clone());
                 std::thread::spawn(move || tx.send(settings::set_daemon(install)));
+                return;
+            }
+            Action::Update => {
+                self.status = tr("Checking for updates...").into();
+                let tx = self.notice_tx.clone();
+                std::thread::spawn(move || {
+                    // On Windows the installer replaces this program and
+                    // starts it again; elsewhere packages do the updating.
+                    #[cfg(windows)]
+                    let done = ff_core::update::update(true, |step| drop(tx.send(step.to_string())));
+                    #[cfg(not(windows))]
+                    let done = ff_core::update::latest().map(|r| match r.is_newer() {
+                        true => format!("Fast search {} is available: {}", r.version(), r.page()),
+                        false => format!("Fast search is up to date ({})", ff_core::update::VERSION),
+                    });
+                    tx.send(done.unwrap_or_else(|e| format!("Could not update: {e}")))
+                });
                 return;
             }
             _ => {}
@@ -3126,7 +3158,7 @@ impl App {
         let (cw, ch) = (self.cv.w as i32, self.cv.h as i32);
         let lines = [
             ("Fast search".to_string(), TEXT),
-            (trf("Version {}", &[&env!("CARGO_PKG_VERSION")]), DIM),
+            (trf("Version {}", &[&ff_core::update::VERSION]), DIM),
             (String::new(), DIM),
             (tr("Instant file search for Linux").to_string(), TEXT),
             (trf("{} files and folders indexed", &[&group_digits(self.index.len() as u64)]), TEXT),

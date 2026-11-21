@@ -49,7 +49,8 @@ Packages for 64-bit Intel/AMD Linux are attached to every
 | Arch Linux | [`packaging/arch/PKGBUILD`](packaging/arch/PKGBUILD) | `cd packaging/arch && makepkg -si` |
 | Any distribution | [`fast-search-x86_64.AppImage`](https://github.com/khunder/fast-search/releases/latest/download/fast-search-x86_64.AppImage) | `chmod +x` it and run it |
 | Plain binaries | [`fast-search-x86_64.tar.gz`](https://github.com/khunder/fast-search/releases/latest/download/fast-search-x86_64.tar.gz) | unpack anywhere |
-| Windows 10/11 | [`fast-search-windows-x86_64.zip`](https://github.com/khunder/fast-search/releases/latest/download/fast-search-windows-x86_64.zip) | unzip anywhere; see [Windows](#windows) |
+| Windows 10/11 | [`fast-search-windows-x86_64-setup.exe`](https://github.com/khunder/fast-search/releases/latest/download/fast-search-windows-x86_64-setup.exe) | run it; see [Windows](#windows) |
+| Windows, no installer | [`fast-search-windows-x86_64.zip`](https://github.com/khunder/fast-search/releases/latest/download/fast-search-windows-x86_64.zip) | unzip anywhere |
 
 Each contains `ff`, `ff-gui` and `ffd`. The AppImage starts the window;
 `./fast-search-x86_64.AppImage ff ...` runs the command. The packages are
@@ -436,7 +437,24 @@ view; without `--group`, only root can read the index.
 
 All three programs and the library run natively on 64-bit Windows 10 and
 later, with the same features and options as on Linux. A release attaches
-`fast-search-windows-x86_64.zip` with `ff.exe`, `ff-gui.exe` and `ffd.exe`.
+two downloads:
+
+- **`fast-search-windows-x86_64-setup.exe`**, the installer. It installs
+  for the current user (no administrator rights; the default folder is
+  `%LOCALAPPDATA%\Programs\Fast search`) or, if you choose, for all users
+  in `Program Files`. It adds the folder to `PATH`, puts "Fast search" in
+  the Start menu with the Ctrl+Alt+F hot key, can add a desktop shortcut,
+  and, when installed for all users, can install the `ffd` service.
+  Uninstall it from *Settings > Apps*. Silent install:
+  `fast-search-windows-x86_64-setup.exe /VERYSILENT /CURRENTUSER /DIR=C:\tools\fast-search`.
+- **`fast-search-windows-x86_64.zip`**, the bare `ff.exe`, `ff-gui.exe` and
+  `ffd.exe`, to unpack anywhere.
+
+**Updating:** `ff update`, or *Help > Check for updates* in the window,
+asks GitHub for the latest release and, if it is newer, downloads its
+installer and runs it silently. The installer keeps the folder, the
+choices made and the install mode, and the window opens again when it is
+done. Copies unpacked from the zip are told where to download instead.
 
 Build them with Rust installed through rustup (the pinned nightly is
 fetched on the first build). Cargo's default target is Linux musl, so name
@@ -449,7 +467,14 @@ cargo test --target x86_64-pc-windows-msvc
 ```
 
 The `.exe` files land in `target/<target>/release/` and need nothing
-installed (the C runtime is linked in).
+installed (the C runtime is linked in). `ff-gui.exe` carries the
+application icon, drawn by the same code as the window's (MSVC builds).
+The installer is built with [Inno Setup 6](https://jrsoftware.org/isinfo.php):
+
+```sh
+cargo win
+pwsh packaging/windows/build-installer.ps1   # writes dist/fast-search-windows-x86_64-setup.exe
+```
 
 What differs from Linux:
 
@@ -460,6 +485,14 @@ What differs from Linux:
   skipping `System Volume Information`, `$Recycle.Bin`, `$WinREAgent` and
   `Config.Msi`. `--no-hidden` also leaves out files with the hidden
   attribute.
+- **NTFS drives are read from their master file table** when the program
+  may open the whole volume: as administrator, and so always for the
+  `ffd` service. The table is read front to back, with no seek per
+  folder, so even hard disks are indexed in seconds (9.4 million files on
+  an SSD and three hard disks: about 23 s, against hours for the folder
+  walk). One reader runs per physical disk. Without administrator rights,
+  and for other filesystems, the folders are walked as on Linux;
+  `FF_NO_MFT=1` forces the walk.
 - **Files are kept** in `%LOCALAPPDATA%\ff\index.db` (the index) and
   `%APPDATA%\ff` (settings, bookmarks).
 - **Desktop actions** use the shell: open with the default application,
@@ -487,8 +520,8 @@ What differs from Linux:
   is stopped are picked up by the full scan when it starts. Every user of
   the machine can read the published index, so it shows the names of all
   files, as the reader group does on Linux.
-- Reading unmounted ext4 or NTFS drives directly (`--device`) is Linux
-  only.
+- Reading unmounted ext4 or NTFS partitions by device (`--device`) is
+  Linux only.
 
 ## Packaging and releases
 
@@ -502,10 +535,12 @@ AppImage needs `mksquashfs` and `curl`; a package whose tool is missing is
 skipped.
 
 Releases are made by GitHub Actions (`.github/workflows/release.yml`):
-pushing a tag such as `v0.2.0` runs the tests, builds all four packages,
-checks them (the `.deb` is installed and run) and publishes them as a
-release. Set the same version in `Cargo.toml` first. The website's
-download buttons point at the latest release, so they need no update.
+pushing a tag such as `v0.2.0` (or `0.2.0`) runs the tests, builds all
+four packages and the Windows installer and zip, checks them (the `.deb`
+is installed and run) and publishes them as a release. The programs,
+packages and installer all take their version from the tag
+(`packaging/version.sh`). The website's download buttons point at the
+latest release, so they need no update.
 
 ## Tests
 

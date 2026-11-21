@@ -17,7 +17,9 @@ set -eu
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$here/.."
 
-version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+# A release build takes its version from the tag ($FF_VERSION), which
+# the programs report too; otherwise Cargo.toml's.
+version=${FF_VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)}
 rel=target/x86_64-unknown-linux-musl/release
 if [ -z "${SKIP_BUILD:-}" ]; then
     # `cargo dist` also rebuilds the standard library for size; that needs
