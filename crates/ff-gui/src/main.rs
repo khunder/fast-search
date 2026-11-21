@@ -887,6 +887,9 @@ impl App {
             Ok("options3") => self.act(Action::Options(3), 0),
             Ok("options4") => self.act(Action::Options(4), 0),
             Ok("options8") => self.act(Action::Options(8), 0),
+            Ok("options9") => self.act(Action::Options(9), 0),
+            Ok("options5") => self.act(Action::Options(5), 0),
+            Ok("options7") => self.act(Action::Options(7), 0),
             Ok("bookmark1") => self.act(Action::Bookmark(0), 0),
             Ok("drives") => self.act(Action::Options(6), 0),
             Ok("apply-preview") => {
@@ -1785,12 +1788,13 @@ impl App {
     /// the chosen page on the right. Changes apply as they are made,
     /// except drive settings, which have their own Apply button.
     fn open_options(&mut self, page: u8) -> io::Result<()> {
-        let page = page.min(8);
+        let page = page.min(9);
         self.refresh_option_states();
         self.load_index_settings();
         let nav = vec![
             NavItem { label: "General", child: false, action: Action::Options(0) },
             NavItem { label: "Interface", child: true, action: Action::Options(0) },
+            NavItem { label: "Language", child: true, action: Action::Options(9) },
             NavItem { label: "Search", child: true, action: Action::Options(1) },
             NavItem { label: "Results", child: true, action: Action::Options(2) },
             NavItem { label: "View", child: true, action: Action::Options(3) },
@@ -1801,7 +1805,7 @@ impl App {
             NavItem { label: "Drives", child: true, action: Action::Options(6) },
             NavItem { label: "Exclude", child: true, action: Action::Options(7) },
         ];
-        let selected = [1, 2, 3, 4, 5, 8, 9, 10, 6][page as usize];
+        let selected = [1, 3, 4, 5, 6, 9, 10, 11, 7, 2][page as usize];
         let (heading, rows) = match page {
             0 => (
                 "Interface",
@@ -1817,16 +1821,17 @@ impl App {
                 ]
                 .into_iter()
                 .chain(theme_choices().iter().map(|&(label, _, action)| Row::Check(label, action)))
-                .chain([
-                    Row::Gap,
-                    Row::Dim("Language".into()),
+                .collect(),
+            ),
+            9 => (
+                "Language",
+                vec![
                     Row::Check("Follow the system", Action::Language(0)),
                     Row::Check("English", Action::Language(1)),
                     Row::Check("Français", Action::Language(2)),
                     Row::Check("Español", Action::Language(3)),
                     Row::Check("Italiano", Action::Language(4)),
-                ])
-                .collect(),
+                ],
             ),
             1 => (
                 "Search",
