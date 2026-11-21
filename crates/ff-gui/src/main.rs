@@ -98,13 +98,17 @@ ENVIRONMENT:
   FF_GUI_FONT        font file to use (default: the system sans-serif)
   FF_GUI_DEBUG       file to append drag-and-drop diagnostics to
   FF_GUI_TITLEBAR    set to system to use the desktop title bar
-                     instead of the built-in one (which shows the icon)
+                     instead of the built-in one (the menu bar, with the
+                     icon and the window buttons)
 ";
 
 /// Text height in pixels at 100% scale.
 const FONT_PX: f32 = 14.5;
 /// Side of the resize grip in the bottom-right corner, in layout units.
 const GRIP: i32 = 16;
+/// Width of each window button (minimize, maximize, close) in our title
+/// bar, in layout units, as Windows draws them.
+const TITLE_BUTTON: i32 = 46;
 
 // The Windows 11 (Fluent) palette, light values; see `canvas::palette`.
 const WHITE: u32 = palette::FIELD;
@@ -328,7 +332,7 @@ const BAR: [(&str, Items); 7] = [
             ("Zoom in", "Ctrl++", Action::ZoomIn),
             ("Zoom out", "Ctrl+-", Action::ZoomOut),
             ("Reset zoom", "Ctrl+0", Action::ZoomReset),
-            ("Title bar with icon", "", Action::ToggleTitleBar),
+            ("Menus in the title bar", "", Action::ToggleTitleBar),
             ("Global shortcut", "", Action::ToggleShortcut),
             ("Show in applications menu", "", Action::ToggleLauncher),
             ("Live updates service", "asks for password", Action::ToggleDaemon),
@@ -1777,7 +1781,7 @@ impl App {
             0 => (
                 "Interface",
                 [
-                    Row::Check("Title bar with the application icon", Action::ToggleTitleBar),
+                    Row::Check("Menus in the title bar, with the application icon", Action::ToggleTitleBar),
                     Row::Gap,
                     Row::Pair("Zoom", format!("{:.0}%", self.scale * 100.0)),
                     Row::Button("Zoom in", Action::ZoomIn),
@@ -2234,8 +2238,8 @@ impl App {
     // ---- our own title bar --------------------------------------------
 
     fn title_button_at(&self, x: i32, y: i32) -> Option<usize> {
-        let (w, bw) = (self.cv.w as i32, 44 * self.u);
-        (self.custom_title && y >= 0 && y < self.title_h() && x >= w - 3 * bw && x < w).then(|| ((x - (w - 3 * bw)) / bw) as usize)
+        let (w, bw) = (self.cv.w as i32, TITLE_BUTTON * self.u);
+        (self.custom_title && y >= 0 && y < self.menu_h() && x >= w - 3 * bw && x < w).then(|| ((x - (w - 3 * bw)) / bw) as usize)
     }
 
     /// Resize direction if (x, y) is on the window's edge.
@@ -2286,7 +2290,8 @@ impl App {
             }
         } else if let Some(edge) = self.resize_edge(x, y) {
             self.b.start_resize(edge);
-        } else if y < self.title_h() {
+        } else if y < self.menu_h() && self.bar_title_at(x, y).is_none() && self.bar_toggle_at(x, y).is_none() {
+            // The menu bar's empty space is the title bar: drag to move.
             if time.wrapping_sub(self.last_title_click) < 400 {
                 self.b.toggle_maximize();
             } else {
@@ -2299,20 +2304,19 @@ impl App {
         true
     }
 
+    /// Our title bar is the menu bar itself: the application icon at its
+    /// left, the window buttons at its right.
     fn draw_title_bar(&mut self) {
-        let (w, th, u) = (self.cv.w as i32, self.title_h(), self.u);
-        self.cv.fill(0, 0, w, th, 0xe6e6e6);
-        self.cv.fill(0, th - 1, w, 1, LINE);
+        let (w, th, u) = (self.cv.w as i32, self.menu_h(), self.u);
         let icon = self.icons.size as i32;
         self.icons.draw(&mut self.cv, 10 * u, (th - icon) / 2, Icon::App);
-        self.text.draw(&mut self.cv, 16 * u + icon, (th - self.text.height) / 2, "Fast search", w / 2, TEXT);
-        let bw = 44 * u;
+        let bw = TITLE_BUTTON * u;
         for button in 0..3 {
             let x = w - (3 - button) * bw;
             let hovered = self.hover_button == Some(button as usize);
-            let ink = if hovered && button == 2 { ON_ACCENT } else { 0x3a3a3a };
+            let ink = if hovered && button == 2 { ON_ACCENT } else { TEXT };
             if hovered {
-                self.cv.fill(x, 0, bw, th - 1, if button == 2 { 0xd93025 } else { 0xd2d2d2 });
+                self.cv.fill(x, 0, bw, th, if button == 2 { 0xc42b1c } else { HOVER });
             }
             // 10-unit glyphs centred in the button.
             let (gx, gy, g, t) = (x + (bw - 10 * u) / 2, (th - 10 * u) / 2, 10 * u, u.max(1));
@@ -2331,7 +2335,8 @@ impl App {
 
     /// (x, width) of each menu-bar title.
     fn bar_titles(&mut self) -> [(i32, i32); BAR.len()] {
-        let mut x = 4 * self.u;
+        // After the application icon when the menu bar is the title bar.
+        let mut x = if self.custom_title { 16 * self.u + self.icons.size as i32 } else { 4 * self.u };
         BAR.map(|(title, _)| {
             let w = self.text.width(tr(title)) + 18 * self.u;
             x += w;
@@ -2348,7 +2353,9 @@ impl App {
             buttons.push(("Size map", Action::Toggle(Flag::SizeMap)));
         }
         let (u, titles_end) = (self.u, self.bar_titles().last().map_or(0, |&(x, w)| x + w));
-        let mut x = self.cv.w as i32 - 6 * u;
+        // Left of the window buttons when the menu bar is the title bar.
+        let buttons_w = if self.custom_title { 3 * TITLE_BUTTON * u } else { 0 };
+        let mut x = self.cv.w as i32 - buttons_w - 6 * u;
         let mut out = Vec::new();
         for (label, action) in buttons.into_iter().rev() {
             let w = self.text.width(tr(label)) + 20 * u;
@@ -2829,14 +2836,14 @@ impl App {
         self.text.height + 6 * self.u
     }
 
-    /// Height of our own title bar (0 when the desktop draws one).
+    /// Height of a separate title bar: none, since ours is the menu bar.
     fn title_h(&self) -> i32 {
-        if self.custom_title { self.row_h() + 10 * self.u } else { 0 }
+        0
     }
 
-    /// Bottom edge of the menu bar.
+    /// Bottom edge of the menu bar, taller when it is also the title bar.
     fn menu_h(&self) -> i32 {
-        self.title_h() + self.row_h()
+        if self.custom_title { self.row_h() + 12 * self.u } else { self.row_h() }
     }
 
     /// Bottom edge of the search box area (where the column headers start).
@@ -2921,10 +2928,11 @@ impl App {
             if open == Some(i) {
                 self.cv.round(x + 2 * u, th + 2 * u, tw - 4 * u, top - th - 4 * u, 4 * u, palette::PICKED);
             }
-            self.text.draw(&mut self.cv, x + 9 * u, th + 3 * u, tr(BAR[i].0), tw, TEXT);
+            self.text.draw(&mut self.cv, x + 9 * u, (top - self.text.height) / 2, tr(BAR[i].0), tw, TEXT);
         }
         for (x, bw, label, action) in self.bar_toggles() {
-            let (y, bh) = (th + 2 * u, top - th - 5 * u);
+            let bh = row_h - 5 * u;
+            let y = (top - bh) / 2;
             let on = self.checked(action);
             if on {
                 self.cv.round(x, y, bw, bh, 4 * u, SELECT);
@@ -2967,8 +2975,7 @@ impl App {
                     self.cv.fill(x, y + 6 * u, 1, row_h - 12 * u, LINE);
                 }
                 let ink = if self.sort == sort { TEXT } else { DIM };
-                let lead = if i == 0 { 6 * u } else { 0 };
-                self.text.draw(&mut self.cv, x + pad + lead, y + 3 * u, &format!("{}{mark}", tr(label)), cw - 2 * pad, ink);
+                self.text.draw(&mut self.cv, x + pad, y + 3 * u, &format!("{}{mark}", tr(label)), cw - 2 * pad, ink);
             }
 
             // Result rows.
@@ -2980,17 +2987,13 @@ impl App {
                 let Some(&id) = self.hits.get(self.top + row) else { break };
                 let y = list_top + row as i32 * row_h;
                 let selected = self.is_selected(self.top + row);
-                let (fg, dim) = (TEXT, DIM);
-                // Windows 11 list rows: a rounded, inset highlight; the
-                // current row also gets the accent mark on its left.
-                let (rx, rw) = (4 * u, w - bar - 6 * u);
+                // Selected rows: filled across in the accent colour, with
+                // white text; the row under the pointer: a rounded tint.
+                let (fg, dim) = if selected { (ON_ACCENT, ON_ACCENT) } else { (TEXT, DIM) };
                 if selected {
-                    self.cv.round(rx, y + u, rw, row_h - 2 * u, 4 * u, palette::PICKED);
-                    if self.top + row == self.sel {
-                        self.cv.round(rx, y + row_h / 2 - 8 * u, 3 * u, 16 * u, 2 * u, SELECT);
-                    }
+                    self.cv.fill(0, y, w - bar, row_h, SELECT);
                 } else if self.hover_row == Some(self.top + row) {
-                    self.cv.round(rx, y + u, rw, row_h - 2 * u, 4 * u, HOVER);
+                    self.cv.round(4 * u, y + u, w - bar - 6 * u, row_h - 2 * u, 4 * u, HOVER);
                 } else if self.flag(Flag::AltRows) && (self.top + row) % 2 == 1 {
                     self.cv.fill(0, y, w - bar, row_h, 0xf6f6f6);
                 }
@@ -3004,9 +3007,9 @@ impl App {
                     None => String::new(),
                 };
                 let kind = Icon::of(self.index.name(id), is_dir, self.index.is_symlink(id));
-                self.icons.draw(&mut self.cv, cols[0].0 + pad + 6 * u, y + (row_h - icon) / 2, kind);
+                self.icons.draw(&mut self.cv, cols[0].0 + pad, y + (row_h - icon) / 2, kind);
                 let ty = y + 3 * u;
-                let name_x = cols[0].0 + pad + 6 * u + icon + 6 * u; // room for the accent mark
+                let name_x = cols[0].0 + pad + icon + 6 * u;
                 self.text.draw(&mut self.cv, name_x, ty, &name, cols[0].0 + cols[0].1 - pad - name_x, fg);
                 self.text.draw(&mut self.cv, cols[1].0 + pad, ty, &parent, cols[1].1 - 2 * pad, dim);
                 if !is_dir {
@@ -3121,7 +3124,10 @@ impl App {
             self.draw_about();
         }
         if self.custom_title {
-            self.cv.frame(0, 0, w, h, 1, 0x8c8c8c); // the window's own border
+            // The window's own border (Windows draws one itself).
+            if cfg!(not(windows)) {
+                self.cv.frame(0, 0, w, h, 1, 0x8c8c8c);
+            }
         }
         self.present()
     }

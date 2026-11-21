@@ -503,8 +503,11 @@ What differs from Linux:
 - **`ff -i`** runs in Windows Terminal or the classic console. Enter and
   F4 open `%VISUAL%` or `%EDITOR%`, else Notepad. There is no `sudoedit`
   and no Ctrl+Z suspend.
-- **The window** has a native title bar, follows the Windows dark mode
-  setting and uses fonts from `C:\Windows\Fonts`. Results can be dragged
+- **The window** looks like a Windows 11 program: its menus sit in the
+  title bar (Windows keeps the rounded corners, shadow and resize
+  borders; *Options → Menus in the title bar* turns it off), text is
+  drawn with ClearType in Segoe UI, the accent colour is the desktop's,
+  and it follows the Windows dark mode setting. Results can be dragged
   to Explorer and copied as files. The global shortcut is a hotkey on a
   Start-menu shortcut, so it needs Ctrl+Alt (default Ctrl+Alt+F).
 - **Live updates:** `ffd` watches each drive with `ReadDirectoryChangesW`

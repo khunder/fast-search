@@ -177,6 +177,7 @@ unsafe extern "system" {
     fn EnableWindow(hwnd: HWND, enable: BOOL) -> BOOL;
     fn SetForegroundWindow(hwnd: HWND) -> BOOL;
     fn IsZoomed(hwnd: HWND) -> BOOL;
+    fn GetSystemMetricsForDpi(index: i32, dpi: u32) -> i32;
     fn CreateIconIndirect(info: *const ICONINFO) -> HANDLE;
 }
 
@@ -279,6 +280,7 @@ const WM_MBUTTONDOWN: u32 = 0x0207;
 const WM_MBUTTONUP: u32 = 0x0208;
 const WM_MOUSEWHEEL: u32 = 0x020A;
 const WM_DPICHANGED: u32 = 0x02E0;
+const WM_NCCALCSIZE: u32 = 0x0083;
 
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
 const WS_POPUP: u32 = 0x8000_0000;
@@ -337,6 +339,9 @@ struct Shared {
     /// Wheel movement not yet turned into whole lines.
     wheel: i32,
     scale: f32,
+    /// The main window draws its own title bar: Windows' caption is hidden
+    /// (its resize borders, shadow and rounded corners stay).
+    own_title: bool,
     /// The program, not the desktop, chose the scale.
     fixed_scale: bool,
 }
@@ -419,6 +424,26 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         WM_CLOSE => push(Event::Close(win)),
         WM_DESTROY => {}
         WM_ERASEBKGND => return 1, // every pixel is painted by us
+        // Our own title bar: the client area takes the caption's place.
+        // The other borders stay Windows', for resizing and the shadow; a
+        // maximized window hangs over the screen edge by its frame, so then
+        // the top keeps that much back.
+        WM_NCCALCSIZE if win == Win::Main && wparam != 0 && with(|s| s.own_title) => {
+            // SAFETY: for WM_NCCALCSIZE with wparam set, lparam points at an
+            // NCCALCSIZE_PARAMS, which starts with the proposed RECT.
+            unsafe {
+                let rect = lparam as *mut RECT;
+                let top = (*rect).top;
+                DefWindowProcW(hwnd, msg, wparam, lparam);
+                (*rect).top = top;
+                if IsZoomed(hwnd) != 0 {
+                    let dpi = GetDpiForWindow(hwnd);
+                    // SM_CYFRAME and SM_CXPADDEDBORDER.
+                    (*rect).top += GetSystemMetricsForDpi(33, dpi) + GetSystemMetricsForDpi(92, dpi);
+                }
+            }
+            return 0;
+        }
         WM_PAINT => {
             let mut ps: PAINTSTRUCT = unsafe { std::mem::zeroed() };
             let dc = unsafe { BeginPaint(hwnd, &mut ps) };
@@ -944,8 +969,17 @@ impl Backend for Win32 {
         Ok(())
     }
 
-    fn set_own_title_bar(&mut self, _own: bool) -> bool {
-        false // Windows draws the frame, with its snap layouts and all
+    fn set_own_title_bar(&mut self, own: bool) -> bool {
+        // Hiding the caption keeps Windows' resize borders, shadow and
+        // rounded corners; the frame is recomputed at once.
+        with(|s| s.own_title = own);
+        const SWP_NOSIZE: u32 = 0x1;
+        const SWP_NOMOVE: u32 = 0x2;
+        const SWP_NOZORDER: u32 = 0x4;
+        const SWP_FRAMECHANGED: u32 = 0x20;
+        // SAFETY: our window.
+        unsafe { SetWindowPos(self.main, std::ptr::null_mut(), 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED) };
+        own
     }
 
     fn dialog_needs_title_bar(&self) -> bool {
