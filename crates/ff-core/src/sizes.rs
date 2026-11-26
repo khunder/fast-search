@@ -34,11 +34,17 @@ pub struct Tree {
     total: Vec<u64>,
     /// Per entry: how many files it holds (1 for a file).
     files: Vec<u32>,
+    /// Per entry: how many folders it holds, at any depth.
+    folders: Vec<u32>,
+    /// Per entry: the newest modification time in it (its own for a file).
+    newest: Vec<i64>,
     /// The children of entry `i` are `kids[first[i]..first[i + 1]]`,
     /// largest first.
     first: Vec<u32>,
     kids: Vec<u32>,
     roots: Vec<u32>,
+    /// Entries taken out since the tree was built (see `remove`).
+    gone: std::collections::HashSet<u32>,
     pub rows: Vec<Node>,
     pub sel: usize,
     pub top: usize,
@@ -57,22 +63,31 @@ impl Tree {
         let n = index.len();
         let mut total = vec![0u64; n];
         let mut files = vec![0u32; n];
+        let mut folders = vec![0u32; n];
+        let mut newest: Vec<i64> = (0..n as u32).map(|id| index.mtime(id)).collect();
         let mut first = vec![0u32; n + 2];
-        for id in 0..n as u32 {
+        for id in (0..n as u32).filter(|&id| !index.is_gone(id)) {
             if let Some(p) = index.parent(id) {
                 first[p as usize + 2] += 1;
             }
-            if index.is_dir(id) {
-                continue;
+            // A file counts for every folder above it, and so does a
+            // folder (in the folder counts), with its date.
+            let is_dir = index.is_dir(id);
+            let (size, mtime) = (if is_dir { 0 } else { index.size(id) }, index.mtime(id));
+            if !is_dir {
+                (total[id as usize], files[id as usize]) = (size, 1);
             }
-            // A file counts for every folder above it.
-            let size = index.size(id);
-            (total[id as usize], files[id as usize]) = (size, 1);
             let mut up = index.parent(id);
             while let Some(p) = up {
-                total[p as usize] += size;
-                files[p as usize] += 1;
-                up = index.parent(p);
+                let p = p as usize;
+                if is_dir {
+                    folders[p] += 1;
+                } else {
+                    total[p] += size;
+                    files[p] += 1;
+                }
+                newest[p] = newest[p].max(mtime);
+                up = index.parent(p as u32);
             }
         }
         for i in 2..n + 2 {
@@ -80,7 +95,7 @@ impl Tree {
         }
         let mut kids = vec![0u32; first[n + 1] as usize];
         let mut roots = Vec::new();
-        for id in 0..n as u32 {
+        for id in (0..n as u32).filter(|&id| !index.is_gone(id)) {
             match index.parent(id) {
                 Some(p) => {
                     let slot = &mut first[p as usize + 1];
@@ -97,7 +112,7 @@ impl Tree {
         }
         largest_first(&mut roots);
         let rows = roots.iter().map(|&id| Node { id, depth: 0, open: false }).collect();
-        let mut tree = Tree { total, files, first, kids, roots, rows, sel: 0, top: 0 };
+        let mut tree = Tree { total, files, folders, newest, first, kids, roots, gone: Default::default(), rows, sel: 0, top: 0 };
         if tree.roots.len() == 1 {
             tree.open(0);
         }
@@ -106,6 +121,16 @@ impl Tree {
 
     pub fn total(&self, id: u32) -> u64 {
         self.total[id as usize]
+    }
+
+    /// Folders inside `id`, at any depth.
+    pub fn folders(&self, id: u32) -> u32 {
+        self.folders[id as usize]
+    }
+
+    /// The newest modification time inside `id` (its own for a file).
+    pub fn newest(&self, id: u32) -> i64 {
+        self.newest[id as usize]
     }
 
     pub fn files(&self, id: u32) -> u32 {
@@ -121,6 +146,38 @@ impl Tree {
     }
 
     /// Shows the children of a row; returns false if it has none.
+    /// Takes entry `id` out of the tree, as when it was deleted: its size
+    /// and counts come off every folder above it, and it leaves the rows
+    /// (with what is shown inside it). Cheap: no rebuild.
+    pub fn remove(&mut self, index: &Index, id: u32) {
+        let i = id as usize;
+        if i >= self.total.len() || self.gone.contains(&id) {
+            return;
+        }
+        let (size, files, folders) = (self.total[i], self.files[i], self.folders[i] + index.is_dir(id) as u32);
+        let mut up = index.parent(id);
+        while let Some(p) = up {
+            let p = p as usize;
+            self.total[p] = self.total[p].saturating_sub(size);
+            self.files[p] = self.files[p].saturating_sub(files);
+            self.folders[p] = self.folders[p].saturating_sub(folders);
+            up = index.parent(p as u32);
+        }
+        self.gone.insert(id);
+        // Its row and the rows shown inside it, which are deeper.
+        if let Some(row) = self.rows.iter().position(|n| n.id == id) {
+            let depth = self.rows[row].depth;
+            let end = row + 1 + self.rows[row + 1..].iter().take_while(|n| n.depth > depth).count();
+            self.rows.drain(row..end);
+            if self.sel >= end {
+                self.sel -= end - row;
+            } else if self.sel >= row {
+                self.sel = row.min(self.rows.len().saturating_sub(1));
+            }
+            self.top = self.top.min(self.rows.len().saturating_sub(1));
+        }
+    }
+
     pub fn open(&mut self, row: usize) -> bool {
         let Some(node) = self.rows.get(row).filter(|n| !n.open) else { return false };
         let (id, depth) = (node.id, node.depth + 1);
@@ -128,7 +185,8 @@ impl Tree {
         if range.is_empty() {
             return false;
         }
-        let children: Vec<Node> = self.kids[range].iter().map(|&id| Node { id, depth, open: false }).collect();
+        let children: Vec<Node> =
+            self.kids[range].iter().filter(|id| !self.gone.contains(id)).map(|&id| Node { id, depth, open: false }).collect();
         if self.sel > row {
             self.sel += children.len();
         }
@@ -177,10 +235,11 @@ impl Tree {
 
     /// The entry with that full path, if it is in the index.
     fn find(&self, index: &Index, path: &[u8]) -> Option<u32> {
-        let inside = |root: &[u8]| path.strip_prefix(root).filter(|rest| rest.is_empty() || rest[0] == b'/' || root.ends_with(b"/"));
+        let sep = crate::os::is_sep;
+        let inside = |root: &[u8]| path.strip_prefix(root).filter(|rest| rest.is_empty() || sep(rest[0]) || root.last().is_some_and(|&b| sep(b)));
         let root = self.roots.iter().copied().filter(|&r| inside(index.name(r)).is_some()).max_by_key(|&r| index.name(r).len())?;
         let rest = inside(index.name(root))?;
-        rest.split(|&b| b == b'/').filter(|part| !part.is_empty()).try_fold(root, |dir, part| self.kids(dir).iter().copied().find(|&k| index.name(k) == part))
+        rest.split(|&b| sep(b)).filter(|part| !part.is_empty()).try_fold(root, |dir, part| self.kids(dir).iter().copied().find(|&k| index.name(k) == part))
     }
 
     pub fn keep(&self, index: &Index) -> Kept {
@@ -209,7 +268,13 @@ impl Tree {
             if tree.find(index, p).is_some_and(|id| tree.reveal(index, id)) {
                 break;
             }
-            path = p.iter().rposition(|&b| b == b'/').filter(|&i| i > 0).map(|i| &p[..i]);
+            // The parent; for `C:\x` that is the root `C:\`, kept whole.
+            path = p.iter().rposition(|&b| crate::os::is_sep(b)).filter(|&i| i > 0).map(|i| {
+                if p[..i].iter().any(|&b| crate::os::is_sep(b)) { &p[..i] } else { &p[..=i] }
+            });
+            if path == Some(p) {
+                break;
+            }
         }
         tree.top = kept.top;
         tree
@@ -233,9 +298,10 @@ impl Tree {
         // Children are sorted, so the ones too small to draw are the tail.
         let scale = w as f64 * h as f64 / sum as f64;
         let room = MAX_TILES.saturating_sub(out.len());
-        let areas: Vec<f64> = self.kids(id).iter().map(|&k| self.total(k) as f64 * scale).take_while(|&a| a >= 12.0).take(room).collect();
+        let kids: Vec<u32> = self.kids(id).iter().copied().filter(|k| !self.gone.contains(k)).collect();
+        let areas: Vec<f64> = kids.iter().map(|&k| self.total(k) as f64 * scale).take_while(|&a| a >= 12.0).take(room).collect();
         let rects = squarify(&areas, x as f64, y as f64, w as f64, h as f64);
-        for (&kid, (rx, ry, rw, rh)) in self.kids(id).iter().zip(rects) {
+        for (&kid, (rx, ry, rw, rh)) in kids.iter().zip(rects) {
             // Rounding both edges keeps neighbours flush.
             let (x0, y0) = (rx.round() as i32, ry.round() as i32);
             let (tw, th) = ((rx + rw).round() as i32 - x0, (ry + rh).round() as i32 - y0);
@@ -368,5 +434,17 @@ mod tests {
             // The point of the algorithm: no long thin slivers.
             assert!(w.max(h) / w.min(h) < 4.0, "{w} x {h}");
         }
+    }
+}
+
+/// A count kept short for a narrow column: 950, 1.5K, 46K, 1.2M.
+pub fn short_count(n: u32) -> String {
+    let n = n as f64;
+    match n {
+        n if n < 1e3 => format!("{n}"),
+        n if n < 1e4 => format!("{:.1}K", n / 1e3),
+        n if n < 1e6 => format!("{:.0}K", n / 1e3),
+        n if n < 1e7 => format!("{:.1}M", n / 1e6),
+        n => format!("{:.0}M", n / 1e6),
     }
 }

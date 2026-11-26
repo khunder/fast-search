@@ -1,33 +1,61 @@
 //! ff-gui: a search-as-you-type window over the ff index.
 
+// On Windows, a window program: no console window opens with it.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+mod app_icon;
 mod backend;
 mod canvas;
 mod complete;
 mod debug;
 mod dialog;
+mod follow;
+#[cfg(windows)]
+mod gdi_text;
 mod i18n;
+#[cfg(unix)]
+mod instance;
+mod keys;
+#[cfg(not(windows))]
+mod linux_icons;
+mod png;
 mod saved;
 mod settings;
+#[cfg(windows)]
+mod shell_icons;
+#[cfg(not(windows))]
+mod svg;
 mod tree;
+#[cfg(not(windows))]
 mod wayland;
+#[cfg(windows)]
+mod win32;
+#[cfg(windows)]
+mod win_tray;
+#[cfg(windows)]
+mod winsys;
+#[cfg(not(windows))]
 mod x11;
+#[cfg(not(windows))]
 mod x11_backend;
+#[cfg(not(windows))]
 mod xkb;
 
 use std::io;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
-use canvas::{Canvas, Icon, Icons, ON_ACCENT, Text};
+use canvas::{Canvas, Icon, Icons, ON_ACCENT, Text, palette};
 use ff_core::{BuildOptions, CaseMode, Index, Kind, Query, SearchOptions, Sort, desktop, group_digits};
 use dialog::{Dialog, NavItem, Row};
 use i18n::{tr, trf};
 use settings::Config;
 use backend::{Backend, Cursor, Event, Key, Mods, Win, WindowSpec};
-use x11::*;
+use keys::*;
 
 const USAGE: &str = "\
 Fast search (ff-gui) - instant file search window
@@ -37,6 +65,8 @@ USAGE:
   ff-gui --install     add Fast search to the applications menu, with its icon
   ff-gui --shortcut on|off|KEYS   make a global shortcut open Fast search
                        (GNOME): Alt+E, or the KEYS you give, e.g. Ctrl+Alt+F
+  ff-gui --hidden      start without showing the window (on Windows, in the
+                       notification area): how it starts at sign-in
 
 KEYS:
   type               search as you type (same term syntax as `ff`)
@@ -72,6 +102,7 @@ KEYS:
   Ctrl+R, Ctrl+B     regular expressions / whole words only
   F5                 rebuild the index (not needed while ffd runs)
   F6                 folder sizes: a tree and a map of what takes the space
+  F7                 show or hide that map
                      (arrows and Enter open folders, Esc goes back)
   click a column     sort by it (again to reverse)
   Esc                clear the search box, or quit when it is empty
@@ -81,21 +112,28 @@ ENVIRONMENT:
   FF_GUI_FONT        font file to use (default: the system sans-serif)
   FF_GUI_DEBUG       file to append drag-and-drop diagnostics to
   FF_GUI_TITLEBAR    set to system to use the desktop title bar
-                     instead of the built-in one (which shows the icon)
+                     instead of the built-in one (the menu bar, with the
+                     icon and the window buttons)
 ";
 
 /// Text height in pixels at 100% scale.
 const FONT_PX: f32 = 14.5;
 /// Side of the resize grip in the bottom-right corner, in layout units.
 const GRIP: i32 = 16;
+/// The main window's title (on Windows also how a second start finds it).
+pub(crate) const WINDOW_TITLE: &str = "Fast search";
+/// Width of each window button (minimize, maximize, close) in our title
+/// bar, in layout units, as Windows draws them.
+const TITLE_BUTTON: i32 = 46;
 
-const WHITE: u32 = 0xffffff;
-const PANEL: u32 = 0xf2f2f2;
-const LINE: u32 = 0xd0d0d0;
-const TEXT: u32 = 0x1f1f1f;
-const DIM: u32 = 0x666666;
-const SELECT: u32 = 0x1a66c9;
-const HOVER: u32 = 0xdbe9fa;
+// The Windows 11 (Fluent) palette, light values; see `canvas::palette`.
+const WHITE: u32 = palette::FIELD;
+const PANEL: u32 = palette::BASE;
+const LINE: u32 = palette::STROKE;
+const TEXT: u32 = palette::INK;
+const DIM: u32 = palette::DIM_INK;
+const SELECT: u32 = canvas::ACCENT;
+const HOVER: u32 = palette::HOVER;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Action {
@@ -124,6 +162,10 @@ enum Action {
     Toggle(Flag),
     /// Colours: 0 follow the desktop, 1 light, 2 dark.
     Theme(u8),
+    /// Start at sign-in, in the notification area (Windows).
+    ToggleAutostart,
+    /// 0: the desktop's accent colour; n: canvas::ACCENTS[n - 1].
+    Accent(u8),
     /// 0 follow the system, 1 English, 2 French, 3 Spanish, 4 Italian.
     Language(u8),
     /// How sizes are written: 0 automatic, 1 bytes, 2 KB, 3 MB.
@@ -167,6 +209,8 @@ enum Action {
     ExportCsv,
     ConfirmExport,
     About,
+    /// Install the newest release, if there is one.
+    Update,
     Quit,
     ZoomIn,
     ZoomOut,
@@ -177,6 +221,20 @@ enum Action {
     SetShortcut,
     ToggleLauncher,
     ToggleDaemon,
+}
+
+/// An index being built on another thread.
+struct Building {
+    /// The new index (already saved), or why there is none.
+    rx: mpsc::Receiver<Result<Index, String>>,
+    /// Entries found so far.
+    found: Arc<AtomicUsize>,
+    started: Instant,
+    /// Entries expected (the last index's), 0 if unknown.
+    expected: usize,
+    /// Paths removed from the window meanwhile: the walk may have seen
+    /// them before they went, so they are checked again at the end.
+    forgotten: Vec<PathBuf>,
 }
 
 /// An on/off option, in the order of `FLAGS`.
@@ -193,10 +251,16 @@ enum Flag {
     SelectedInStatus,
     WildcardWholeName,
     MatchPath,
+    /// Closing hides the window to the notification area (Windows).
+    CloseToTray,
+    /// File icons from the system (Explorer's, or the icon theme), not ours.
+    SystemIcons,
+    /// The map of the selected folder beside the folder sizes tree.
+    SizeMap,
 }
 
 /// Each option's name in the settings file and its default.
-const FLAGS: [(&str, bool); 11] = [
+const FLAGS: [(&str, bool); 14] = [
     ("hide_results_when_empty", false),
     ("close_on_open", false),
     ("path_double_click", true),
@@ -208,6 +272,9 @@ const FLAGS: [(&str, bool); 11] = [
     ("selected_in_status_bar", false),
     ("wildcards_whole_name", true),
     ("match_path", false),
+    ("close_to_tray", true),
+    ("system_icons", true),
+    ("show_size_map", true),
 ];
 
 /// Menu entries: label, shortcut hint, action.
@@ -237,7 +304,7 @@ const TEXT_CONTEXT_MENU: Items = &[
 ];
 
 /// The menu bar.
-const BAR: [(&str, Items); 6] = [
+const BAR: [(&str, Items); 7] = [
     (
         "File",
         &[
@@ -276,8 +343,11 @@ const BAR: [(&str, Items); 6] = [
             ("Regular expressions", "Ctrl+R", Action::ToggleRegex),
             ("Whole words only", "Ctrl+B", Action::ToggleWord),
             ("Folder sizes", "F6", Action::TreeSize),
+            ("Size map", "F7", Action::Toggle(Flag::SizeMap)),
         ],
     ),
+    // Filled in from canvas::THEMES when it opens.
+    ("Theme", &[]),
     // Filled in from the saved bookmarks when it opens.
     ("Bookmarks", &[]),
     (
@@ -288,7 +358,7 @@ const BAR: [(&str, Items); 6] = [
             ("Zoom in", "Ctrl++", Action::ZoomIn),
             ("Zoom out", "Ctrl+-", Action::ZoomOut),
             ("Reset zoom", "Ctrl+0", Action::ZoomReset),
-            ("Title bar with icon", "", Action::ToggleTitleBar),
+            ("Menus in the title bar", "", Action::ToggleTitleBar),
             ("Global shortcut", "", Action::ToggleShortcut),
             ("Show in applications menu", "", Action::ToggleLauncher),
             ("Live updates service", "asks for password", Action::ToggleDaemon),
@@ -300,10 +370,37 @@ const BAR: [(&str, Items); 6] = [
             ("Search syntax", "F1", Action::Help(0)),
             ("Filters", "", Action::Help(1)),
             ("Keyboard shortcuts", "", Action::Help(2)),
+            ("Check for updates", "", Action::Update),
             ("About Fast search", "", Action::About),
         ],
     ),
 ];
+
+/// "System" (follow the desktop) and every theme of `canvas::THEMES`, as
+/// menu entries and preferences rows: built once.
+fn theme_choices() -> Items {
+    static CHOICES: std::sync::OnceLock<Vec<(&'static str, &'static str, Action)>> = std::sync::OnceLock::new();
+    CHOICES.get_or_init(|| {
+        let themes = canvas::THEMES.iter().enumerate().map(|(i, t)| (t.name, "", Action::Theme(i as u8 + 1)));
+        std::iter::once(("System", "", Action::Theme(0))).chain(themes).collect()
+    })
+}
+
+/// The desktop's accent colour and every one of `canvas::ACCENTS`, as
+/// menu entries: built once.
+fn accent_choices() -> Items {
+    static CHOICES: std::sync::OnceLock<Vec<(&'static str, &'static str, Action)>> = std::sync::OnceLock::new();
+    CHOICES.get_or_init(|| {
+        let accents = canvas::ACCENTS.iter().enumerate().map(|(i, a)| (a.0, "", Action::Accent(i as u8 + 1)));
+        std::iter::once(("System accent", "", Action::Accent(0))).chain(accents).collect()
+    })
+}
+
+/// The Theme menu: the themes, then the accent colours.
+fn theme_menu() -> Items {
+    static MENU: std::sync::OnceLock<Vec<(&'static str, &'static str, Action)>> = std::sync::OnceLock::new();
+    MENU.get_or_init(|| theme_choices().iter().chain(accent_choices()).copied().collect())
+}
 
 /// An open menu: a result's right-click menu or one from the menu bar.
 struct Menu {
@@ -331,6 +428,11 @@ struct App {
     icons: Icons,
     /// Pixels per layout unit (the rounded desktop scale).
     u: i32,
+    /// Widths of the Name, Path, Size and Modified columns chosen by dragging
+    /// their edges, at a scale of 1; None: automatic.
+    column_widths: Option<[f32; 4]>,
+    /// The header edge being dragged: 1 after Name ... 4 after Modified.
+    column_drag: Option<usize>,
     size_w: i32,
     date_w: i32,
 
@@ -400,6 +502,7 @@ struct App {
     flags: [bool; FLAGS.len()],
     size_format: u8,
     theme: u8,
+    accent: u8,
     language: u8,
     /// Row under the pointer, for the mouseover highlight.
     hover_row: Option<usize>,
@@ -418,6 +521,8 @@ struct App {
     options_page: Option<u8>,
     /// Options for the next rebuild, when they differ from the last one's.
     pending_build: Option<BuildOptions>,
+    /// An index being built in the background, shown with its progress.
+    building: Option<Building>,
     /// The drives as shown (and edited) on the Drives screen.
     drives: Vec<settings::Drive>,
     drive_selected: usize,
@@ -425,6 +530,18 @@ struct App {
     auto_drives: bool,
     /// The files a confirmation dialog is asking about.
     pending_paths: Vec<PathBuf>,
+    /// The index entries of `pending_paths`, in the same order.
+    pending_ids: Vec<u32>,
+    /// A delete running in the background: its result arrives here.
+    deleting: Option<mpsc::Receiver<Deleted>>,
+    /// Without the ffd daemon: the window follows changes to the drives
+    /// itself.
+    follow: Option<follow::Follow>,
+    /// The index changed while the window was hidden: search again when
+    /// it shows.
+    results_stale: bool,
+    /// When the folder sizes view was last redone for followed changes.
+    tree_refreshed: Instant,
     /// That drop was a move, so the files leave the results when it ends.
     drop_moved: bool,
     last_click: (u32, usize),
@@ -432,6 +549,15 @@ struct App {
     tree: Option<tree::Tree>,
     /// The tiles of its map as last drawn, and the one under the pointer.
     tiles: Vec<tree::Tile>,
+    /// Per root of the folder sizes tree: its drive's capacity and free
+    /// space, where known.
+    disks: Vec<(u32, (u64, u64))>,
+    /// The window is hidden, the program still running (closed with
+    /// "keep running", or started at sign-in).
+    hidden: bool,
+    /// Requests from later starts of the program to show the window.
+    #[cfg(unix)]
+    wake: Option<mpsc::Receiver<()>>,
     tile_hover: Option<u32>,
     /// The list of completions open under the search box.
     complete: Option<complete::Complete>,
@@ -440,10 +566,128 @@ struct App {
     bookmarks: Vec<ff_core::bookmarks::Bookmark>,
     bookmark_selected: usize,
     bookmark_items: Items,
+
+    /// The search windows other than the one in the fields above, by
+    /// number (None: closed, or the current one). See `Session`.
+    windows: Vec<Option<Session>>,
+    /// The number of the search window whose state is in the fields.
+    current: u8,
+    /// The current window has changes not drawn yet (kept for each window
+    /// while another is current).
+    pending_draw: bool,
+    /// Something every window shows changed (theme, scale, language, a
+    /// new index): all are drawn again.
+    redraw_all: bool,
+    /// The search running in the background, if any, and searches given
+    /// up on (a later key made them useless) that are still finishing.
+    search_job: Option<SearchJob>,
+    dropped_searches: Vec<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>,
+    /// The current window's results are out of date: a search waits.
+    search_pending: bool,
+    /// When the user last typed, clicked, scrolled or moved the pointer:
+    /// followed file changes wait until they pause, so dragging and typing
+    /// stay smooth.
+    last_input: Instant,
+}
+
+/// A search on a thread of its own, so typing never waits for one: the
+/// window keeps showing the last results until these arrive.
+struct SearchJob {
+    window: u8,
+    stop: Arc<AtomicBool>,
+    rx: mpsc::Receiver<Option<Vec<u32>>>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+/// The index, lent to a search thread. Sound because the index is never
+/// changed, replaced or dropped while a search thread runs: every change
+/// first stops them all (`App::quiesce`), and `App` stops them when it
+/// is dropped.
+struct IndexRef(*const Index);
+
+// SAFETY: see above; the index is only read through it.
+unsafe impl Send for IndexRef {}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.quiesce();
+    }
+}
+
+/// Declares the state each search window has of its own: `Session`
+/// holds it for the windows not current, and `App::swap_session`
+/// exchanges it with the fields of `App`, which always hold the current
+/// window's. The index, settings, dialog and background work are shared
+/// by all windows (one engine, as in Everything).
+macro_rules! per_window {
+    ($($field:ident: $ty:ty,)*) => {
+        struct Session {
+            $($field: $ty,)*
+        }
+
+        impl App {
+            fn swap_session(&mut self, s: &mut Session) {
+                $(std::mem::swap(&mut self.$field, &mut s.$field);)*
+            }
+        }
+    };
+}
+
+per_window! {
+    cv: Canvas,
+    drag_arm: Option<DragArm>,
+    column_drag: Option<usize>,
+    query: String,
+    cursor: usize,
+    anchor: usize,
+    box_scroll: i32,
+    selecting: bool,
+    last_box_click: u32,
+    hits: Vec<u32>,
+    sel: usize,
+    marks: BTreeSet<usize>,
+    anchor_row: usize,
+    collapse_on_release: Option<usize>,
+    top: usize,
+    kind: Kind,
+    case: CaseMode,
+    regex: bool,
+    whole_word: bool,
+    query_error: Option<String>,
+    sort: Sort,
+    reverse: bool,
+    status: String,
+    menu: Option<Menu>,
+    props: Option<Vec<(&'static str, String)>>,
+    about: bool,
+    hover_button: Option<usize>,
+    last_title_click: u32,
+    dragging_scrollbar: bool,
+    hover_row: Option<usize>,
+    results_stale: bool,
+    tree_refreshed: Instant,
+    last_click: (u32, usize),
+    tree: Option<tree::Tree>,
+    tiles: Vec<tree::Tile>,
+    disks: Vec<(u32, (u64, u64))>,
+    tile_hover: Option<u32>,
+    complete: Option<complete::Complete>,
+    pending_draw: bool,
+    search_pending: bool,
 }
 
 fn main() -> ExitCode {
+    // A window program has no console of its own: write to the one it
+    // was started from, if any, and show fatal errors in a message box.
+    #[cfg(windows)]
+    winsys::attach_console();
+    run()
+}
+
+fn run() -> ExitCode {
     let mut db = None;
+    // Started at sign-in: to the notification area, no window.
+    let mut hidden = false;
     let mut query = Vec::new();
     let mut args = std::env::args();
     args.next();
@@ -454,9 +698,21 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "-V" | "--version" => {
-                println!("ff-gui {}", env!("CARGO_PKG_VERSION"));
+                println!("ff-gui {}", ff_core::update::VERSION);
                 return ExitCode::SUCCESS;
             }
+            // For packaging: the icon as an .ico file (the Windows installer uses it).
+            "--write-icon" => {
+                let Some(file) = args.next() else { return ExitCode::from(2) };
+                return match std::fs::write(&file, app_icon::ico()) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("ff-gui: {file}: {e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            "--hidden" => hidden = true,
             "--db" => db = args.next().map(PathBuf::from),
             "--shortcut" => {
                 // "on" uses the keys chosen before (Alt+E at first).
@@ -494,12 +750,14 @@ fn main() -> ExitCode {
                     }
                 };
             }
+            #[cfg(not(windows))]
             "--hold-wayland-clipboard" => {
                 return match wayland::hold_clipboard() {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(_) => ExitCode::FAILURE,
                 };
             }
+            #[cfg(not(windows))]
             "--hold-clipboard" => {
                 return match x11_backend::hold_clipboard(args.next().as_deref() == Some("file")) {
                     Ok(()) => ExitCode::SUCCESS,
@@ -521,6 +779,28 @@ fn main() -> ExitCode {
             _ => query.push(a),
         }
     }
+    // Already running (perhaps hidden in the notification area): show that
+    // window, which has the index loaded, instead of starting again; a
+    // hidden start (at sign-in) then has nothing to do. Test runs, which
+    // draw one frame and exit, always start their own.
+    #[cfg(windows)]
+    if std::env::var_os("FF_GUI_SNAPSHOT").is_none() && std::env::var_os("FF_GUI_TEST").is_none() {
+        if hidden && win_tray::running(WINDOW_TITLE) {
+            return ExitCode::SUCCESS;
+        }
+        if !hidden && win_tray::wake_running(WINDOW_TITLE) {
+            return ExitCode::SUCCESS;
+        }
+    }
+    #[cfg(unix)]
+    if std::env::var_os("FF_GUI_SNAPSHOT").is_none() && std::env::var_os("FF_GUI_TEST").is_none() {
+        if hidden && instance::running() {
+            return ExitCode::SUCCESS;
+        }
+        if !hidden && instance::wake_running() {
+            return ExitCode::SUCCESS;
+        }
+    }
     let follow_default = db.is_none();
     let Some(db) = db.or_else(ff_core::default_db_path) else {
         eprintln!("ff-gui: HOME is not set; use --db");
@@ -528,10 +808,18 @@ fn main() -> ExitCode {
     };
     // Mends a shortcut saved wrongly by an earlier version, out of the way.
     std::thread::spawn(settings::repair_shortcut);
-    match App::new(db, follow_default, query.join(" ")).and_then(|mut app| app.run()) {
+    // Changes followed since the index was last written are kept for the
+    // next start.
+    match App::new(db, follow_default, query.join(" "), hidden).and_then(|mut app| {
+        let result = app.run();
+        app.save_followed();
+        result
+    }) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("ff-gui: {e}");
+            #[cfg(windows)]
+            winsys::error_box(&format!("ff-gui: {e}"));
             ExitCode::FAILURE
         }
     }
@@ -540,6 +828,7 @@ fn main() -> ExitCode {
 /// Asks the kernel whether we may use a file in a way (`mode`: 4 read,
 /// 2 write, 1 search). `None` if that could not be told, for instance
 /// because the file is gone: the action itself then reports it.
+#[cfg(unix)]
 fn access(path: &std::path::Path, mode: i32) -> Option<bool> {
     use std::os::unix::ffi::OsStrExt;
     unsafe extern "C" {
@@ -557,14 +846,31 @@ fn access(path: &std::path::Path, mode: i32) -> Option<bool> {
 }
 
 /// False if we may not open the file, or list the folder.
+#[cfg(unix)]
 fn may_read(path: &std::path::Path) -> bool {
     let mode = if path.is_dir() { 4 | 1 } else { 4 };
     access(path, mode) != Some(false)
 }
 
+/// On Windows access is decided by access control lists, which only an
+/// attempt tells reliably: a folder that refuses to be listed says no.
+#[cfg(windows)]
+fn may_read(path: &std::path::Path) -> bool {
+    let denied = |r: io::Result<()>| r.is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied);
+    if path.is_dir() { !denied(std::fs::read_dir(path).map(drop)) } else { !denied(std::fs::File::open(path).map(drop)) }
+}
+
+/// On Windows: anything but a drive's root; a refusal shows when the
+/// action is tried.
+#[cfg(windows)]
+fn may_delete(path: &std::path::Path) -> bool {
+    path.parent().is_some()
+}
+
 /// False if we may not remove the file from its folder (to delete it,
 /// trash it or move it). That is decided by the folder, not the file;
 /// in a "sticky" folder such as /tmp only the owner may.
+#[cfg(unix)]
 fn may_delete(path: &std::path::Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     let Some(folder) = path.parent() else { return false }; // the root itself
@@ -579,6 +885,16 @@ fn may_delete(path: &std::path::Path) -> bool {
     let (Ok(inside), Ok(holder)) = (path.symlink_metadata(), folder.metadata()) else { return true };
     let me = std::fs::metadata("/proc/self").map_or(holder.uid(), |m| m.uid());
     holder.mode() & 0o1000 == 0 || me == 0 || me == inside.uid() || me == holder.uid()
+}
+
+/// A typed folder without trailing separators, except where one is part
+/// of a root (`/`, `C:\`).
+fn trim_folder(typed: &str) -> String {
+    let trimmed = typed.trim_end_matches(['/', std::path::MAIN_SEPARATOR]);
+    if trimmed.is_empty() || trimmed.ends_with(':') {
+        return typed.to_string();
+    }
+    trimmed.to_string()
 }
 
 fn debug(msg: impl AsRef<str>) {
@@ -597,19 +913,19 @@ struct DragArm {
 /// What a drag is called in messages: a file name, or "5 items".
 fn drag_label(paths: &str) -> String {
     match paths.lines().count() {
-        1 => paths.rsplit('/').next().unwrap_or(paths).to_string(),
+        1 => paths.rsplit(['/', std::path::MAIN_SEPARATOR]).next().unwrap_or(paths).to_string(),
         n => trf("{} items", &[&n]),
     }
 }
 
 impl App {
-    fn new(db: PathBuf, follow_default: bool, query: String) -> io::Result<App> {
+    fn new(db: PathBuf, follow_default: bool, query: String, hidden: bool) -> io::Result<App> {
         let config = Config::load();
         let (notice_tx, notices) = mpsc::channel();
         // FF_GUI_SCALE beats the saved zoom, which beats the desktop scale.
         let env_scale = std::env::var("FF_GUI_SCALE").ok().and_then(|v| v.parse::<f32>().ok());
         let fixed = env_scale.or(config.scale).map(|s| s.clamp(0.5, 8.0));
-        let mut b = backend::connect(&WindowSpec { title: "Fast search", width: 1000, height: 640, scale: fixed })?;
+        let mut b = backend::connect(&WindowSpec { title: WINDOW_TITLE, width: 1000, height: 640, scale: fixed, hidden })?;
         let auto_scale = if env_scale.is_some() { env_scale.unwrap() } else { b.scale() };
         debug(format!("display: {} at scale {auto_scale}", b.name()));
         let scale = fixed.unwrap_or(auto_scale);
@@ -624,6 +940,11 @@ impl App {
             drag_paths: String::new(),
             drag_copy_only: false,
             cv: Canvas::new(),
+            column_widths: config.more.get("column_widths").and_then(|v| {
+                let w: Vec<f32> = v.split(',').filter_map(|n| n.trim().parse().ok()).collect();
+                (w.len() == 4 && w.iter().all(|&n| n > 0.0)).then(|| [w[0], w[1], w[2], w[3]])
+            }),
+            column_drag: None,
             size_w: text.width("000,000,000 KB") + 16 * u,
             date_w: text.width("0000-00-00 00:00") + 16 * u,
             text,
@@ -677,7 +998,8 @@ impl App {
             dialog: None,
             flags: FLAGS.map(|(key, default)| config.more.get(key).map_or(default, |v| v == "on")),
             size_format: config.more.get("size_format").and_then(|v| v.parse().ok()).filter(|f| *f < 4).unwrap_or(2),
-            theme: config.more.get("theme").and_then(|v| v.parse().ok()).filter(|t| *t < 3).unwrap_or(0),
+            theme: config.more.get("theme").and_then(|v| v.parse().ok()).filter(|&t: &u8| (t as usize) <= canvas::THEMES.len()).unwrap_or(0),
+            accent: config.more.get("accent").and_then(|v| v.parse().ok()).filter(|&a: &u8| (a as usize) <= canvas::ACCENTS.len()).unwrap_or(0),
             language: config.more.get("language").and_then(|v| v.parse().ok()).filter(|l| *l < 5).unwrap_or(0),
             hover_row: None,
             dialog_input: String::new(),
@@ -689,8 +1011,15 @@ impl App {
             options_page: None,
             drives: Vec::new(),
             pending_build: None,
+            building: None,
             tree: None,
             tiles: Vec::new(),
+            disks: Vec::new(),
+            hidden,
+            #[cfg(unix)]
+            wake: (std::env::var_os("FF_GUI_SNAPSHOT").is_none() && std::env::var_os("FF_GUI_TEST").is_none())
+                .then(instance::listen)
+                .flatten(),
             tile_hover: None,
             complete: None,
             bookmarks: ff_core::bookmarks::load(),
@@ -699,11 +1028,31 @@ impl App {
             drive_selected: 0,
             auto_drives: true,
             pending_paths: Vec::new(),
+            pending_ids: Vec::new(),
+            deleting: None,
+            follow: None,
+            results_stale: false,
+            tree_refreshed: Instant::now(),
+            windows: vec![None],
+            current: 0,
+            pending_draw: false,
+            redraw_all: false,
+            search_job: None,
+            dropped_searches: Vec::new(),
+            search_pending: false,
+            last_input: Instant::now(),
             drop_moved: false,
             last_click: (0, usize::MAX),
         };
         app.apply_title_bar();
         app.apply_theme();
+        app.apply_hotkey();
+        // Started at sign-in: Windows made no window visible; elsewhere it
+        // is hidden now.
+        #[cfg(unix)]
+        if app.hidden {
+            app.hidden = app.b.hide_to_tray();
+        }
         app.apply_language();
         app.cv.resize((1000 * u) as usize, (640 * u) as usize);
         Ok(app)
@@ -719,6 +1068,11 @@ impl App {
     fn event_loop(&mut self) -> io::Result<()> {
         if self.index.is_empty() {
             self.reindex()?; // first start: no index yet
+            // The test hooks below look at the first frame: give them the
+            // finished index, not its progress.
+            if std::env::var_os("FF_GUI_TEST").is_some() || std::env::var_os("FF_GUI_SNAPSHOT").is_some() {
+                self.finish_build(true);
+            }
         }
         self.search();
         // Test hooks: open a panel, save the first frame, exit.
@@ -731,6 +1085,7 @@ impl App {
                 self.open_bar_menu(2);
                 self.menu.as_mut().unwrap().hover = Some(1);
             }
+            Ok("themes") => self.open_bar_menu(3),
             Ok("about") => self.about = true,
             // Copy as a real key press would, then quit: the copy must survive.
             Ok("copy") => self.act(Action::CopyFile, 123_456_789),
@@ -752,6 +1107,9 @@ impl App {
             Ok("options3") => self.act(Action::Options(3), 0),
             Ok("options4") => self.act(Action::Options(4), 0),
             Ok("options8") => self.act(Action::Options(8), 0),
+            Ok("options9") => self.act(Action::Options(9), 0),
+            Ok("options5") => self.act(Action::Options(5), 0),
+            Ok("options7") => self.act(Action::Options(7), 0),
             Ok("bookmark1") => self.act(Action::Bookmark(0), 0),
             Ok("drives") => self.act(Action::Options(6), 0),
             Ok("apply-preview") => {
@@ -802,16 +1160,18 @@ impl App {
             Ok("trash-all-now") => {
                 // Trashes every result of the query without asking (tests only).
                 self.marks = (0..self.hits.len()).collect();
-                self.pending_paths = self.selected_paths();
+                (self.pending_ids, self.pending_paths) = self.selected_entries();
                 self.act(Action::ConfirmTrash, 0);
+                self.finish_delete(true);
                 eprintln!("{} | results left: {}", self.status, self.hits.len());
                 return Ok(());
             }
             Ok("trash-now") => {
                 // Trashes the selected result without asking (tests only).
                 if self.sel < self.hits.len() {
-                    self.pending_paths = self.selected_paths();
+                    (self.pending_ids, self.pending_paths) = self.selected_entries();
                     self.act(Action::ConfirmTrash, 0);
+                    self.finish_delete(true);
                     eprintln!("{} | results left: {}", self.status, self.hits.len());
                 }
                 return Ok(());
@@ -831,10 +1191,48 @@ impl App {
                 self.act(Action::CopyFile, 123_456_789);
                 return Ok(());
             }
-            Ok("reindex") => self.reindex()?,
+            Ok("reindex") => {
+                self.reindex()?;
+                self.finish_build(true);
+            }
             Ok("tree") => self.toggle_tree(),
+            // Times drawing while scrolling through the whole list (as by
+            // dragging the scroll bar), into FF_GUI_DEBUG.
+            Ok("scroll-bench") => {
+                if self.cv.w == 0 {
+                    self.cv.resize(1000, 640);
+                }
+                let rows = self.rows_visible().max(1);
+                let (mut total, mut worst, mut frames) = (Duration::ZERO, Duration::ZERO, 0u32);
+                let step = (self.hits.len() / 200).max(rows);
+                let mut top = 0;
+                while top < self.hits.len() && frames < 200 {
+                    self.top = top;
+                    let t = Instant::now();
+                    let _ = self.render();
+                    let took = t.elapsed();
+                    total += took;
+                    worst = worst.max(took);
+                    frames += 1;
+                    top += step;
+                }
+                debug::log(format!("scroll-bench: {frames} frames of {}x{}, average {:?}, worst {:?}", self.cv.w, self.cv.h, total / frames.max(1), worst));
+                return Ok(());
+            }
+            // A second window, searching on its own (the first keeps its
+            // search): the snapshot shows the second.
+            Ok("second-window") => {
+                self.query = "first".into();
+                self.search();
+                self.summoned();
+                self.query = "second".into();
+                self.search();
+                self.switch_to(0);
+                assert_eq!(self.query, "first");
+                self.switch_to(1);
+            }
             Ok("complete") => self.update_completion(),
-            Ok("bookmarks") => self.open_bar_menu(3),
+            Ok("bookmarks") => self.open_bar_menu(4),
             Ok("bookmark-add") => self.act(Action::AddBookmark, 0),
             Ok("export") => self.act(Action::ExportCsv, 0),
             Ok("export-now") => {
@@ -843,7 +1241,7 @@ impl App {
                 eprintln!("{}", self.status);
                 return Ok(());
             }
-            Ok("options") => self.open_bar_menu(4),
+            Ok("options") => self.open_bar_menu(5),
             Ok("props") => self.act(Action::Properties, 0),
             Ok("select") => self.anchor = self.step(self.cursor, false, true),
             _ => {}
@@ -861,6 +1259,38 @@ impl App {
                 self.refresh_option_states();
                 self.render_dialog()?;
             }
+            // Another start of the program (such as the global shortcut)
+            // asked for the window (Linux; Windows sends a message).
+            #[cfg(unix)]
+            if self.wake.as_ref().is_some_and(|rx| rx.try_recv().is_ok()) {
+                self.summoned();
+                self.refresh_if_stale();
+                self.act(Action::SelectAll, 0);
+                dirty = true;
+            }
+            // Files' own icons read in the background came in.
+            if self.icons.take_loaded() {
+                dirty = true;
+            }
+            // A delete running in the background finished.
+            if self.deleting.is_some() && self.finish_delete(false) {
+                dirty = true;
+            }
+            // Results of a background search came in; searches that had to
+            // wait start.
+            if self.finish_search(false) {
+                dirty = true;
+            }
+            self.resume_searches();
+            // Files changed on the drives (without the daemon).
+            if self.follow_changes() {
+                dirty = true;
+            }
+            // Something all windows show changed: draw them all.
+            if std::mem::take(&mut self.redraw_all) && self.windows.iter().any(Option::is_some) {
+                self.render_all()?;
+                dirty = false;
+            }
             // A message in the status bar goes away by itself, unless it
             // reports something still going on.
             if self.status != shown.0 {
@@ -875,10 +1305,28 @@ impl App {
             }
             // Redraw only once the event queue is drained.
             // While idle, wake once a second to notice a refreshed index.
-            let wait = if dirty { Duration::ZERO } else { Duration::from_secs(1) };
+            // While indexing, wake often to move the progress along.
+            // Hidden (Linux), wake often to answer another start quickly.
+            // Shown and following the drives, wake often so changes show
+            // at once; also while catching up, to keep the checks fed.
+            let idle = if self.searching() {
+                Duration::from_millis(10) // results show as soon as they are in
+            } else if self.building.is_some() || self.deleting.is_some() || self.icons.loading() || (self.hidden && cfg!(unix)) {
+                Duration::from_millis(150)
+            } else if self.follow.as_ref().is_some_and(|f| !self.hidden || f.catching_up()) {
+                Duration::from_millis(250)
+            } else {
+                Duration::from_secs(1)
+            };
+            let wait = if dirty { Duration::ZERO } else { idle };
             let Some(event) = self.b.next_event(Some(wait))? else {
                 if !dirty {
-                    dirty = self.reload_if_changed();
+                    dirty = if self.building.is_some() {
+                        self.finish_build(false);
+                        true
+                    } else {
+                        self.reload_if_changed()
+                    };
                     continue;
                 }
                 self.render()?;
@@ -892,6 +1340,31 @@ impl App {
                 dirty = false;
                 continue;
             };
+            // Events go to the window they happened in: it becomes current.
+            // (With the dialog open, the others take no input.)
+            let target = match &event {
+                Event::Redraw(w) | Event::Close(w) | Event::Resize(w, ..) => Some(*w),
+                Event::Key { win, .. } | Event::Press { win, .. } | Event::Motion { win, .. } | Event::Scroll { win, .. } => Some(*win),
+                Event::Release { win, .. } => Some(*win),
+                Event::Shown => Some(backend::FIRST),
+                _ => None,
+            };
+            if matches!(event, Event::Key { .. } | Event::Press { .. } | Event::Motion { .. } | Event::Scroll { .. }) {
+                self.last_input = Instant::now();
+            }
+            if let Some(Win::Main(n)) = target.filter(|_| self.dialog.is_none()) {
+                if n != self.current {
+                    if dirty {
+                        self.render()?;
+                    }
+                    self.pending_draw = false;
+                    self.switch_to(n);
+                    dirty = std::mem::take(&mut self.pending_draw) || n == self.current;
+                }
+            }
+            if self.dialog.is_some() && matches!(target, Some(Win::Main(n)) if n != self.current) {
+                continue;
+            }
             // The dialog is modal: it gets its own events, and the main
             // window takes no input while it is open.
             if self.dialog.is_some() {
@@ -911,7 +1384,7 @@ impl App {
             }
             match event {
                 Event::Redraw(_) => dirty = true,
-                Event::Resize(w, h) => {
+                Event::Resize(_, w, h) => {
                     if (w, h) != (self.cv.w, self.cv.h) {
                         self.cv.resize(w, h);
                         self.menu = None;
@@ -931,7 +1404,24 @@ impl App {
                         dirty = true;
                     }
                 }
-                Event::Close(_) => return Ok(()),
+                Event::Close(_) => {
+                    if !self.dismiss() {
+                        return Ok(());
+                    }
+                }
+                Event::Quit => return Ok(()),
+                Event::Summoned => {
+                    self.summoned();
+                    dirty = true;
+                }
+                // Back from the notification area: typing replaces the
+                // last search.
+                Event::Shown => {
+                    self.hidden = false;
+                    self.refresh_if_stale();
+                    self.act(Action::SelectAll, 0);
+                    dirty = true;
+                }
                 Event::Key { key, mods, .. } => {
                     if !self.key(key, mods)? {
                         return Ok(());
@@ -949,6 +1439,9 @@ impl App {
                     dirty |= std::mem::replace(at, top) != top;
                 }
                 Event::Release { button: 1, .. } => {
+                    if self.column_drag.take().is_some() {
+                        self.save_config();
+                    }
                     self.dragging_scrollbar = false;
                     self.selecting = false;
                     self.drag_arm = None;
@@ -960,6 +1453,12 @@ impl App {
                 }
                 Event::Release { .. } => {}
                 Event::Motion { x, y, mods, .. } => {
+                    if let Some(edge) = self.column_drag {
+                        self.drag_column(edge, x);
+                        self.b.set_cursor(Cursor::Resize(3));
+                        dirty = true;
+                        continue;
+                    }
                     let hover = self.title_button_at(x, y);
                     dirty |= std::mem::replace(&mut self.hover_button, hover) != hover;
                     let cursor = self.cursor_at(x, y);
@@ -1016,7 +1515,8 @@ impl App {
 
     // ---- state ---------------------------------------------------------
 
-    fn search(&mut self) {
+    /// The search box's query and the list's options, as `search` uses.
+    fn current_query(&self) -> (Query, SearchOptions) {
         let opts = SearchOptions {
             kind: self.kind,
             sort: self.sort,
@@ -1030,18 +1530,135 @@ impl App {
             match_path: self.flag(Flag::MatchPath),
             wildcards_anywhere: !self.flag(Flag::WildcardWholeName),
         };
-        let query = Query::parse_opts(&self.query, &how);
+        (Query::parse_opts(&self.query, &how), opts)
+    }
+
+    /// Searches the index for the current window's query, on a thread of
+    /// its own: the window keeps working with its last results until the
+    /// new ones arrive (`finish_search`). A search still running is given
+    /// up: its results would be out of date.
+    fn search(&mut self) {
+        let (query, opts) = self.current_query();
         self.query_error = query.error().map(String::from);
-        self.hits = if self.flag(Flag::HideEmpty) && self.query.trim().is_empty() {
-            Vec::new() // an empty search box shows an empty list
-        } else {
-            self.index.search(&query, &opts)
-        };
+        self.search_pending = false;
+        self.drop_search();
+        if self.flag(Flag::HideEmpty) && self.query.trim().is_empty() {
+            self.show_results(Vec::new()); // an empty search box shows an empty list
+            return;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let (index, flag) = (IndexRef(&self.index), stop.clone());
+        let handle = std::thread::spawn(move || {
+            let index = index;
+            // SAFETY: see `IndexRef`.
+            let index = unsafe { &*index.0 };
+            let _ = tx.send(index.search_until(&query, &opts, &flag));
+        });
+        self.search_job = Some(SearchJob { window: self.current, stop, rx, handle });
+        // Tests take pictures at once: they wait for the results.
+        if std::env::var_os("FF_GUI_TEST").is_some() || std::env::var_os("FF_GUI_SNAPSHOT").is_some() {
+            self.finish_search(true);
+        }
+    }
+
+    /// New results for the current window, from the top.
+    fn show_results(&mut self, hits: Vec<u32>) {
+        self.hits = hits;
         self.hover_row = None;
         self.sel = 0;
         self.top = 0;
         self.marks.clear();
         self.anchor_row = 0;
+    }
+
+    /// Gives up the running search, if any, without waiting for its thread.
+    /// A search for another window is done again later.
+    fn drop_search(&mut self) {
+        if let Some(job) = self.search_job.take() {
+            job.stop.store(true, Ordering::Relaxed);
+            self.dropped_searches.push((job.stop, job.handle));
+            if job.window != self.current {
+                if let Some(Some(w)) = self.windows.get_mut(job.window as usize) {
+                    w.search_pending = true;
+                }
+            }
+        }
+        self.dropped_searches.retain(|(_, h)| !h.is_finished());
+    }
+
+    /// Takes in the results of the background search if they are there
+    /// (`wait`: waits for them). True if a window got new results.
+    fn finish_search(&mut self, wait: bool) -> bool {
+        let Some(job) = &self.search_job else { return false };
+        let result = if wait {
+            job.rx.recv().ok().flatten()
+        } else {
+            match job.rx.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => return false,
+                Err(mpsc::TryRecvError::Disconnected) => None,
+            }
+        };
+        let Some(job) = self.search_job.take() else { return false };
+        let _ = job.handle.join();
+        let Some(hits) = result else { return false };
+        let current = self.current;
+        let open = job.window == current || self.windows.get(job.window as usize).is_some_and(Option::is_some);
+        if !open {
+            return false; // its window was closed meanwhile
+        }
+        self.switch_to(job.window);
+        self.show_results(hits);
+        if job.window != current {
+            if !(self.current == 0 && self.hidden) {
+                let _ = self.render();
+            }
+            self.switch_to(current);
+            return false;
+        }
+        true
+    }
+
+    /// True while a search runs in the background.
+    fn searching(&self) -> bool {
+        self.search_job.is_some()
+    }
+
+    /// Stops every search thread and waits for them: the index is about
+    /// to change. The window whose search stopped searches again after.
+    fn quiesce(&mut self) {
+        if let Some(job) = self.search_job.take() {
+            job.stop.store(true, Ordering::Relaxed);
+            let _ = job.handle.join();
+            if job.window == self.current {
+                self.search_pending = true;
+            } else if let Some(Some(w)) = self.windows.get_mut(job.window as usize) {
+                w.search_pending = true;
+            }
+        }
+        for (stop, handle) in self.dropped_searches.drain(..) {
+            stop.store(true, Ordering::Relaxed);
+            let _ = handle.join();
+        }
+    }
+
+    /// Starts a search that had to wait (one at a time): the current
+    /// window's first. True if one started.
+    fn resume_searches(&mut self) -> bool {
+        if self.searching() {
+            return false;
+        }
+        if self.search_pending {
+            self.search();
+            return true;
+        }
+        let Some(n) = (0..self.windows.len()).find(|&n| self.windows[n].as_ref().is_some_and(|w| w.search_pending)) else { return false };
+        let current = self.current;
+        self.switch_to(n as u8);
+        self.search();
+        self.switch_to(current);
+        true
     }
 
     // ---- search box editing -------------------------------------------
@@ -1149,7 +1766,12 @@ impl App {
         let Ok(index) = Index::load(&self.db) else { return false }; // mid-rewrite: retry next tick
         self.db_stamp = stamp;
         let kept = self.keep_tree();
+        self.quiesce();
         self.index = index;
+        if let Some(f) = &mut self.follow {
+            f.replaced();
+        }
+        self.research_all();
         self.restore_tree(kept);
         let (sel, top) = (self.sel, self.top);
         self.search();
@@ -1158,29 +1780,209 @@ impl App {
         true
     }
 
+    /// Without the daemon, follows changes on the indexed drives and
+    /// patches the index; true if the results changed. The index file is
+    /// written again once quiet while the window is hidden.
+    fn follow_changes(&mut self) -> bool {
+        let wanted = self.db.as_os_str() != ff_core::SYSTEM_DB
+            && std::env::var_os("FF_GUI_SNAPSHOT").is_none()
+            && std::env::var_os("FF_GUI_TEST").is_none()
+            && self.index.len() > 0;
+        if !wanted {
+            self.follow = None;
+            return false;
+        }
+        // While a build or a search runs, events wait: they apply to the
+        // new index, or once the search is done. So they do while the user
+        // is busy in a window (a quarter of a second after the last input),
+        // so dragging and typing are never held up.
+        if self.building.is_some() || self.searching() || self.last_input.elapsed() < Duration::from_millis(250) {
+            return false;
+        }
+        if self.follow.as_ref().is_none_or(|f| !f.suits(&self.index)) {
+            self.follow = Some(follow::Follow::new(&self.index, &self.db));
+        }
+        let old_len = self.index.len() as u32;
+        let Some(f) = self.follow.as_mut() else { return false };
+        let found = f.check(&mut self.index, !self.hidden);
+        if std::mem::take(&mut f.lost) {
+            self.status = tr("Some folders cannot be followed; changes there show after the next indexing").into();
+        }
+        match found {
+            follow::Found::Nothing => {
+                if self.hidden && f.time_to_save() {
+                    self.save_followed();
+                }
+                false
+            }
+            follow::Found::Restart => {
+                // New watchers and a catch-up; what the index has unsaved
+                // is still to be written.
+                let unsaved = f.unsaved;
+                let mut fresh = follow::Follow::new(&self.index, &self.db);
+                fresh.unsaved = unsaved;
+                self.follow = Some(fresh);
+                false
+            }
+            follow::Found::Changed => {
+                let touched = f.take_touched();
+                // Every window's results; a hidden one is searched again
+                // when it shows (nobody sees it meanwhile).
+                let current = self.current;
+                // Every window's results, a hidden one's too: it, or a new
+                // window taking its list, shows at once when called.
+                self.each_window(|app| {
+                    app.update_results(old_len, &touched);
+                    let shown = !(app.current == 0 && app.hidden);
+                    if shown && app.current != current {
+                        let _ = app.render();
+                    }
+                });
+                !(self.current == 0 && self.hidden)
+            }
+        }
+    }
+
+    /// Searches again if the index changed while the window was hidden.
+    fn refresh_if_stale(&mut self) {
+        if std::mem::take(&mut self.results_stale) {
+            let kept = self.keep_tree();
+            self.restore_tree(kept);
+            self.search();
+        }
+    }
+
+    /// Brings the results up to date with a patched index without
+    /// searching again (which, on millions of entries and with files
+    /// changing several times a second, would keep every core busy): gone
+    /// entries leave the list, and only new entries (from `old_len` on) and
+    /// those whose size or time changed are matched and put in their place.
+    /// The folder sizes view, costlier, is redone at most every few seconds.
+    fn update_results(&mut self, old_len: u32, touched: &[u32]) {
+        if self.tree.is_some() && self.tree_refreshed.elapsed() >= Duration::from_secs(5) {
+            self.tree_refreshed = Instant::now();
+            let kept = self.keep_tree();
+            self.restore_tree(kept);
+        }
+        let selected = self.hits.get(self.sel).copied();
+        let before = self.hits.len();
+        let index = &self.index;
+        self.hits.retain(|&h| !index.is_gone(h) && !touched.contains(&h));
+        let mut changed = self.hits.len() != before;
+        if !(self.flag(Flag::HideEmpty) && self.query.trim().is_empty()) {
+            let (query, opts) = self.current_query();
+            let candidates = touched.iter().copied().chain(old_len..self.index.len() as u32);
+            for id in candidates {
+                if !self.index.is_gone(id) && self.index.matches(&query, &opts, id) {
+                    self.index.insert_sorted(&mut self.hits, id, &opts);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            // Rows moved: extra selected rows no longer mean the same.
+            self.marks.clear();
+            self.hover_row = None;
+        }
+        // Keep the same entry selected when it is still there.
+        self.sel = selected.and_then(|id| self.hits.iter().position(|&h| h == id)).unwrap_or(self.sel).min(self.hits.len().saturating_sub(1));
+        self.top = self.top.min(self.max_top());
+    }
+
+    /// Writes the followed changes to the index file.
+    fn save_followed(&mut self) {
+        let Some(f) = self.follow.as_mut().filter(|f| f.unsaved) else { return };
+        f.unsaved = false;
+        let start = Instant::now();
+        let saved = self.index.save(&self.db);
+        debug::log(format!("follow: index saved ({saved:?}) in {:?}", start.elapsed()));
+        if saved.is_ok() {
+            // Our own write: nothing to load again.
+            self.db_stamp = std::fs::metadata(&self.db).and_then(|m| m.modified()).ok();
+        }
+    }
+
     fn reindex(&mut self) -> io::Result<()> {
         if self.db.as_os_str() == ff_core::SYSTEM_DB {
             self.status = tr("The index is kept up to date by the ffd daemon").into();
             return Ok(());
         }
-        self.status = tr("Indexing...").into();
-        self.render()?;
+        if self.building.is_some() {
+            return Ok(()); // already under way: its progress is showing
+        }
+        // The walk runs in the background; the window stays usable with
+        // the old index and shows how far the new one has got.
         let opts = self.pending_build.take().unwrap_or_else(|| BuildOptions::refresh(&self.index));
-        match Index::build(&opts) {
-            Ok(index) => {
-                self.status = match index.save(&self.db) {
-                    Ok(()) => String::new(),
-                    Err(e) => format!("could not save the index: {e}"),
-                };
+        let found = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel();
+        let (db, counter) = (self.db.clone(), found.clone());
+        std::thread::spawn(move || {
+            let result = Index::build_with_progress(&opts, &counter).map_err(|e| format!("indexing failed: {e}")).and_then(|index| {
+                index.save(&db).map_err(|e| format!("could not save the index: {e}"))?;
+                Ok(index)
+            });
+            let _ = tx.send(result);
+        });
+        // The last index's size is a good guess at the new one's.
+        self.building = Some(Building { rx, found, started: Instant::now(), expected: self.index.len(), forgotten: Vec::new() });
+        self.status.clear();
+        Ok(())
+    }
+
+    /// Takes the finished index, if the background build is done
+    /// (`wait`: block until it is).
+    fn finish_build(&mut self, wait: bool) {
+        let Some(build) = &self.building else { return };
+        let result = if wait {
+            build.rx.recv().map_err(|_| ())
+        } else {
+            match build.rx.try_recv() {
+                Ok(result) => Ok(result),
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => Err(()),
+            }
+        };
+        let took = build.started.elapsed();
+        let forgotten = self.building.take().map(|b| b.forgotten).unwrap_or_default();
+        match result {
+            Ok(Ok(index)) => {
                 self.db_stamp = std::fs::metadata(&self.db).and_then(|m| m.modified()).ok();
                 let kept = self.keep_tree();
+                self.quiesce();
                 self.index = index;
+                if let Some(f) = &mut self.follow {
+                    f.replaced();
+                }
+                self.research_all();
                 self.restore_tree(kept);
+                self.status = trf("Indexed {} entries in {} s", &[&group_digits(self.index.len() as u64), &format!("{:.1}", took.as_secs_f64())]);
+                if !forgotten.is_empty() {
+                    self.forget(&forgotten);
+                }
             }
-            Err(e) => self.status = format!("indexing failed: {e}"),
+            Ok(Err(e)) => self.status = e,
+            Err(()) => self.status = tr("indexing failed").into(),
         }
         self.search();
-        Ok(())
+        // Options changed while this build ran: build again with them.
+        if self.pending_build.is_some() {
+            let _ = self.reindex();
+        }
+    }
+
+    /// The status bar text while indexing: entries found, an estimate of
+    /// how far along that is, and the time taken.
+    fn build_status(&self) -> Option<(String, Option<f64>)> {
+        let build = self.building.as_ref()?;
+        let found = build.found.load(Ordering::Relaxed);
+        let secs = build.started.elapsed().as_secs();
+        let share = (build.expected > 0).then(|| (found as f64 / build.expected as f64).min(0.99));
+        let count = trf("Indexing... {} entries", &[&group_digits(found as u64)]);
+        let text = match share {
+            Some(share) => format!("{count}  ·  {:.0} %  ·  {secs} s", share * 100.0),
+            None => format!("{count}  ·  {secs} s"),
+        };
+        Some((text, share))
     }
 
     /// Runs a menu or keyboard action.
@@ -1269,6 +2071,11 @@ impl App {
                 self.apply_theme();
                 return self.save_config();
             }
+            Action::Accent(accent) => {
+                self.accent = accent;
+                self.apply_theme();
+                return self.save_config();
+            }
             Action::ToggleRegex => {
                 self.regex = !self.regex;
                 self.save_config();
@@ -1311,7 +2118,7 @@ impl App {
                 // From the text field, or the folder selected in the results
                 // (the folder holding it, if a file is selected).
                 let folder = if action == Action::AddExclude {
-                    std::mem::take(&mut self.dialog_input).trim().trim_end_matches('/').to_string()
+                    trim_folder(std::mem::take(&mut self.dialog_input).trim())
                 } else {
                     let Some(&id) = self.hits.get(self.sel) else {
                         self.status = tr("Select a folder in the results first").into();
@@ -1320,7 +2127,7 @@ impl App {
                     let folder = if self.index.is_dir(id) { Some(id) } else { self.index.parent(id) };
                     folder.map(|f| self.index.path(f).to_string_lossy().into_owned()).unwrap_or_default()
                 };
-                if !folder.starts_with('/') {
+                if !std::path::Path::new(&folder).is_absolute() {
                     self.status = tr("A folder to exclude must be a full path, like /home/me/Videos").into();
                 } else if !self.excludes.contains(&folder) {
                     self.exclude_selected = self.excludes.len();
@@ -1385,26 +2192,8 @@ impl App {
                 return;
             }
             Action::ConfirmTrash | Action::ConfirmDelete => {
-                let paths = std::mem::take(&mut self.pending_paths);
-                let trash = action == Action::ConfirmTrash;
-                let mut failures = Vec::new();
-                for path in &paths {
-                    if let Err(e) = if trash { desktop::trash(path) } else { desktop::delete(path) } {
-                        failures.push(format!("{}: {e}", path.display()));
-                    }
-                }
-                let done = paths.len() - failures.len();
-                let what = match &paths[..] {
-                    [one] => one.display().to_string(),
-                    _ => trf("{} items", &[&done]),
-                };
-                self.status = match (&failures[..], trash) {
-                    ([], true) => trf("Moved {} to the trash", &[&what]),
-                    ([], false) => trf("Deleted {}", &[&what]),
-                    ([one], _) if paths.len() == 1 => one.clone(),
-                    (failed, _) => format!("{done} done, {} failed; first: {}", failed.len(), failed[0]),
-                };
-                return self.forget(&paths);
+                let (ids, paths) = (std::mem::take(&mut self.pending_ids), std::mem::take(&mut self.pending_paths));
+                return self.start_delete(ids, paths, action == Action::ConfirmTrash);
             }
             Action::Quit => return self.quit = true,
             Action::ZoomIn | Action::ZoomOut | Action::ZoomReset => {
@@ -1432,6 +2221,8 @@ impl App {
                     Ok(false) => "Global shortcut removed".into(),
                     Err(e) => format!("could not change the shortcut: {e}"),
                 };
+                self.apply_hotkey();
+                self.refresh_option_states();
                 return;
             }
             Action::SetShortcut => {
@@ -1449,9 +2240,21 @@ impl App {
                         if self.status.is_empty() {
                             self.status = status;
                         }
+                        // Registering may fail (keys taken): that is said instead.
+                        self.apply_hotkey();
+                        self.refresh_option_states();
                     }
                     Err(e) => self.status = format!("could not change the shortcut: {e}"),
                 }
+                return;
+            }
+            Action::ToggleAutostart => {
+                let on = !settings::autostart_enabled();
+                self.status = match settings::set_autostart(on) {
+                    Ok(()) if on => "Fast search starts at sign-in, hidden, ready for its shortcut".into(),
+                    Ok(()) => "Fast search no longer starts at sign-in".into(),
+                    Err(e) => format!("could not change the start at sign-in: {e}"),
+                };
                 return;
             }
             Action::ToggleLauncher => {
@@ -1469,6 +2272,23 @@ impl App {
                 std::thread::spawn(move || tx.send(settings::set_daemon(install)));
                 return;
             }
+            Action::Update => {
+                self.status = tr("Checking for updates...").into();
+                let tx = self.notice_tx.clone();
+                std::thread::spawn(move || {
+                    // On Windows the installer replaces this program and
+                    // starts it again; elsewhere packages do the updating.
+                    #[cfg(windows)]
+                    let done = ff_core::update::update(true, |step| drop(tx.send(step.to_string())));
+                    #[cfg(not(windows))]
+                    let done = ff_core::update::latest().map(|r| match r.is_newer() {
+                        true => format!("Fast search {} is available: {}", r.version(), r.page()),
+                        false => format!("Fast search is up to date ({})", ff_core::update::VERSION),
+                    });
+                    tx.send(done.unwrap_or_else(|e| format!("Could not update: {e}")))
+                });
+                return;
+            }
             _ => {}
         }
         let Some(&id) = self.hits.get(self.sel) else { return };
@@ -1483,9 +2303,9 @@ impl App {
                 self.status = format!("{} results selected: open at most 20 at a time", paths.len());
             }
             Action::Open if self.flag(Flag::CloseOnOpen) => {
-                // Open first, then close: nothing is left running to do it later.
+                // Open first, then close (or hide to the notification area).
                 paths.iter().for_each(|p| drop(desktop::open(p)));
-                self.quit = true;
+                self.quit = !self.dismiss();
             }
             Action::Open => {
                 self.status = if many { trf("Opening {} items", &[&paths.len()]) } else { trf("Opening {}", &[&path.display()]) };
@@ -1497,6 +2317,12 @@ impl App {
             }
             Action::Trash | Action::DeleteForever => {
                 let forever = action == Action::DeleteForever;
+                // Windows asks and shows the progress itself, as Explorer
+                // does (test runs keep our dialog, to draw it).
+                if cfg!(windows) && std::env::var_os("FF_GUI_TEST").is_none() {
+                    let (ids, paths) = self.selected_entries();
+                    return self.start_delete(ids, paths, !forever);
+                }
                 let question = match (forever, many, self.index.is_dir(id)) {
                     (false, true, _) => trf("Move these {} items to the trash?", &[&paths.len()]),
                     (false, false, true) => tr("Move this folder and everything in it to the trash?").to_string(),
@@ -1523,7 +2349,7 @@ impl App {
                 } else {
                     ("Move to trash", vec![("Cancel", None), ("Move to trash", Some(Action::ConfirmTrash))], 1)
                 };
-                self.pending_paths = paths;
+                (self.pending_ids, self.pending_paths) = self.selected_entries();
                 if let Err(e) = self.open_dialog(title, rows, buttons, focus, forever) {
                     self.status = e.to_string();
                 }
@@ -1565,12 +2391,13 @@ impl App {
     /// the chosen page on the right. Changes apply as they are made,
     /// except drive settings, which have their own Apply button.
     fn open_options(&mut self, page: u8) -> io::Result<()> {
-        let page = page.min(8);
+        let page = page.min(9);
         self.refresh_option_states();
         self.load_index_settings();
         let nav = vec![
             NavItem { label: "General", child: false, action: Action::Options(0) },
             NavItem { label: "Interface", child: true, action: Action::Options(0) },
+            NavItem { label: "Language", child: true, action: Action::Options(9) },
             NavItem { label: "Search", child: true, action: Action::Options(1) },
             NavItem { label: "Results", child: true, action: Action::Options(2) },
             NavItem { label: "View", child: true, action: Action::Options(3) },
@@ -1581,12 +2408,12 @@ impl App {
             NavItem { label: "Drives", child: true, action: Action::Options(6) },
             NavItem { label: "Exclude", child: true, action: Action::Options(7) },
         ];
-        let selected = [1, 2, 3, 4, 5, 8, 9, 10, 6][page as usize];
+        let selected = [1, 3, 4, 5, 6, 9, 10, 11, 7, 2][page as usize];
         let (heading, rows) = match page {
             0 => (
                 "Interface",
-                vec![
-                    Row::Check("Title bar with the application icon", Action::ToggleTitleBar),
+                [
+                    Row::Check("Menus in the title bar, with the application icon", Action::ToggleTitleBar),
                     Row::Gap,
                     Row::Pair("Zoom", format!("{:.0}%", self.scale * 100.0)),
                     Row::Button("Zoom in", Action::ZoomIn),
@@ -1594,11 +2421,14 @@ impl App {
                     Row::Button("Reset to the desktop scale", Action::ZoomReset),
                     Row::Gap,
                     Row::Dim("Theme".into()),
-                    Row::Check("Follow the desktop", Action::Theme(0)),
-                    Row::Check("Light", Action::Theme(1)),
-                    Row::Check("Dark", Action::Theme(2)),
-                    Row::Gap,
-                    Row::Dim("Language".into()),
+                ]
+                .into_iter()
+                .chain(theme_choices().iter().map(|&(label, _, action)| Row::Check(label, action)))
+                .collect(),
+            ),
+            9 => (
+                "Language",
+                vec![
                     Row::Check("Follow the system", Action::Language(0)),
                     Row::Check("English", Action::Language(1)),
                     Row::Check("Français", Action::Language(2)),
@@ -1645,6 +2475,8 @@ impl App {
                     Row::Check("Alternate row color", Action::Toggle(Flag::AltRows)),
                     Row::Check("Show row mouseover", Action::Toggle(Flag::RowHover)),
                     Row::Check("Show selected item in status bar", Action::Toggle(Flag::SelectedInStatus)),
+                    Row::Check("Show the size map beside the folder sizes", Action::Toggle(Flag::SizeMap)),
+                    Row::Check("File icons from the system (as its file manager shows them)", Action::Toggle(Flag::SystemIcons)),
                     Row::Gap,
                     Row::Dim("Size format".into()),
                     Row::Check("Auto (B, KB, MB, GB)", Action::SizeFormat(0)),
@@ -1658,11 +2490,13 @@ impl App {
                 vec![
                     Row::Check("A global shortcut opens Fast search", Action::ToggleShortcut),
                     Row::Pair("Shortcut", self.shortcut_keys.clone()),
-                    Row::Dim("To change it, type the keys, such as Ctrl+Alt+F, and press Enter:".into()),
+                    Row::Dim("To change it, click the box below and press the new keys, such as Alt+Q:".into()),
                     Row::Input("Ctrl+Alt+F", Action::SetShortcut),
                     // What came of the last change, or why it was refused.
                     Row::Dim(self.status.clone()),
                     Row::Check("Show in the applications menu", Action::ToggleLauncher),
+                    Row::Check("Closing the window keeps Fast search running, ready for its shortcut", Action::Toggle(Flag::CloseToTray)),
+                    Row::Check("Start at sign-in, hidden", Action::ToggleAutostart),
                 ],
             ),
             5 => (
@@ -1816,6 +2650,7 @@ impl App {
                     pair("Ctrl+S", "export the results as a CSV file"),
                     pair("F5", "rebuild the index"),
                     pair("F6", "folder sizes: what takes the space"),
+                    pair("F7", "show or hide the size map beside the folder sizes"),
                     pair("Ctrl +, Ctrl -, Ctrl 0", "zoom in, out, reset"),
                     pair("Esc", "clear the search box; quit when it is empty"),
                 ],
@@ -1845,17 +2680,108 @@ impl App {
 
     /// Makes the results reflect that `paths` were just removed, without
     /// waiting for the next index refresh.
+    /// Deletes `paths` (index entries `ids`) on a worker thread, so the
+    /// window stays responsive: to the trash, or for good. On Windows,
+    /// Windows itself does it, with its own confirmation and progress.
+    /// The outcome comes back through `deleting` (see `finish_delete`).
+    fn start_delete(&mut self, ids: Vec<u32>, paths: Vec<PathBuf>, trash: bool) {
+        if paths.is_empty() || self.deleting.is_some() {
+            return;
+        }
+        let count = paths.len();
+        self.status = if trash { trf("Moving {} items to the trash...", &[&count]) } else { trf("Deleting {} items...", &[&count]) };
+        let (tx, rx) = mpsc::channel();
+        self.deleting = Some(rx);
+        #[cfg(windows)]
+        let owner = self.b.native_window();
+        std::thread::spawn(move || {
+            #[cfg(windows)]
+            let outcome = match ff_core::win::shell_delete(&paths, !trash, owner) {
+                Ok(true) => None,
+                Ok(false) => Some(tr("Cancelled").to_string()),
+                Err(e) => Some(e.to_string()),
+            };
+            #[cfg(not(windows))]
+            let outcome = {
+                let failed: Vec<String> = paths
+                    .iter()
+                    .filter_map(|p| (if trash { desktop::trash(p) } else { desktop::delete(p) }).err().map(|e| format!("{}: {e}", p.display())))
+                    .collect();
+                failed.first().map(|first| format!("{} failed; first: {first}", failed.len()))
+            };
+            let _ = tx.send(Deleted { ids, paths, trash, problem: outcome });
+        });
+    }
+
+    /// Takes a finished delete's outcome, if one is ready (or, with
+    /// `wait`, waits for it): what is really gone leaves the results and
+    /// the sizes tree at once, without rebuilding the index.
+    fn finish_delete(&mut self, wait: bool) -> bool {
+        let Some(rx) = &self.deleting else { return false };
+        let done = if wait { rx.recv().ok() } else { rx.try_recv().ok() };
+        let Some(done) = done else {
+            // The worker died without a word: stop waiting for it.
+            if wait || matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
+                self.deleting = None;
+            }
+            return false;
+        };
+        self.deleting = None;
+        // Only what is really gone, and still the same entry.
+        let mut gone = Vec::new();
+        for (&id, path) in done.ids.iter().zip(&done.paths) {
+            let same = (id as usize) < self.index.len() && self.index.path(id) == *path;
+            if same && std::fs::symlink_metadata(path).is_err() {
+                gone.push(id);
+            }
+        }
+        if let Some(tree) = self.tree.as_mut() {
+            for &id in &gone {
+                tree.remove(&self.index, id);
+            }
+        }
+        self.quiesce();
+        self.index.remove(&gone);
+        if let Some(build) = &mut self.building {
+            build.forgotten.extend(done.paths.iter().filter(|p| std::fs::symlink_metadata(p).is_err()).cloned());
+        }
+        let (sel, top) = (self.sel, self.top);
+        self.search();
+        self.sel = sel.min(self.hits.len().saturating_sub(1));
+        self.top = top.min(self.max_top());
+        let what = match &done.paths[..] {
+            [one] if gone.len() == 1 => one.display().to_string(),
+            _ => trf("{} items", &[&gone.len()]),
+        };
+        self.status = match (done.problem, done.trash) {
+            (Some(problem), _) if gone.is_empty() => problem,
+            (Some(problem), _) => format!("{} {}      {problem}", gone.len(), tr("removed")),
+            (None, true) => trf("Moved {} to the trash", &[&what]),
+            (None, false) => trf("Deleted {}", &[&what]),
+        };
+        true
+    }
+
     fn forget(&mut self, paths: &[PathBuf]) {
-        use std::os::unix::ffi::OsStrExt;
+        if let Some(build) = &mut self.building {
+            build.forgotten.extend_from_slice(paths);
+        }
         let changes: std::collections::HashSet<_> = paths
             .iter()
-            .filter_map(|p| Some((p.parent()?.as_os_str().as_bytes().to_vec(), p.file_name()?.as_bytes().to_vec())))
+            .filter_map(|p| Some((ff_core::os::path_bytes(p.parent()?).to_vec(), ff_core::os::bytes(p.file_name()?).to_vec())))
             .collect();
         // Checks the disk: an entry only goes if the file really is gone.
+        // It is marked gone in place, so ids held elsewhere stay valid.
         let kept = self.keep_tree();
-        let mut live = ff_core::live::LiveIndex::new(std::mem::take(&mut self.index));
-        live.apply(&changes);
-        self.index = live.into_index();
+        self.quiesce();
+        match &mut self.follow {
+            Some(f) => {
+                f.apply(&mut self.index, &changes);
+            }
+            None => {
+                ff_core::live::Tracker::new(&self.index).apply(&mut self.index, &changes);
+            }
+        }
         self.restore_tree(kept);
         let (sel, top) = (self.sel, self.top);
         self.search();
@@ -1865,6 +2791,7 @@ impl App {
 
     /// Switches the texts to the chosen language.
     fn apply_language(&mut self) {
+        self.redraw_all = true;
         i18n::set_language(match self.language {
             0 => i18n::system_language(),
             chosen => chosen as usize - 1,
@@ -1874,12 +2801,31 @@ impl App {
     /// Switches the palette to the chosen theme; "follow the desktop"
     /// asks the desktop whether it prefers dark.
     fn apply_theme(&mut self) {
-        let dark = match self.theme {
-            1 => false,
-            2 => true,
-            _ => settings::desktop_prefers_dark(),
+        self.redraw_all = true;
+        // FF_GUI_THEME=<first word of a theme's name> pins it, for test
+        // pictures: light, dark, graphite, ...
+        let pinned = std::env::var("FF_GUI_THEME").ok().and_then(|t| {
+            canvas::THEMES.iter().position(|th| th.name.split(' ').next().unwrap_or("").eq_ignore_ascii_case(&t))
+        });
+        // Theme 0 follows the desktop (Light or Dark); n is THEMES[n - 1].
+        let index = match pinned {
+            Some(i) => i,
+            None if self.theme == 0 => settings::desktop_prefers_dark() as usize,
+            None => self.theme as usize - 1,
         };
-        canvas::set_dark(dark);
+        canvas::set_theme(index);
+        // A colour chosen here, else the desktop's: on Windows the accent
+        // colour of its personalization settings (stored as 0xAABBGGRR),
+        // elsewhere the first of the list.
+        if let Some(&(_, rgb)) = (self.accent as usize).checked_sub(1).and_then(|i| canvas::ACCENTS.get(i)) {
+            canvas::set_accent(rgb);
+            return;
+        }
+        canvas::set_accent(canvas::ACCENTS[0].1);
+        #[cfg(windows)]
+        if let Some(abgr) = winsys::reg_dword(winsys::HKEY_CURRENT_USER, r"Software\Microsoft\Windows\DWM", "AccentColor") {
+            canvas::set_accent((abgr & 0xff) << 16 | (abgr & 0xff00) | (abgr >> 16 & 0xff));
+        }
     }
 
     /// The line on the index pages saying how their changes are saved.
@@ -1943,6 +2889,7 @@ impl App {
             Action::Toggle(flag) => self.flag(flag),
             Action::SizeFormat(format) => format == self.size_format,
             Action::Theme(theme) => theme == self.theme,
+            Action::Accent(accent) => accent == self.accent,
             Action::Language(language) => language == self.language,
             Action::SelectExclude(i) => i as usize == self.exclude_selected,
             Action::SelectBookmark(i) => i as usize == self.bookmark_selected,
@@ -1955,10 +2902,20 @@ impl App {
             Action::TreeSize => self.tree.is_some(),
             Action::Case(case) => case == self.case,
             Action::ToggleTitleBar => self.custom_title,
+            Action::ToggleAutostart => settings::autostart_enabled(),
             Action::ToggleShortcut => self.shortcut_on,
             Action::ToggleLauncher => self.launcher_on,
             Action::ToggleDaemon => self.daemon_on,
             _ => false,
+        }
+    }
+
+    /// Registers the global shortcut with the running program (Windows),
+    /// or drops it when it is off.
+    fn apply_hotkey(&mut self) {
+        let keys = settings::shortcut_enabled().then(settings::current_shortcut).flatten();
+        if let Err(e) = self.b.set_hotkey(keys.as_deref()) {
+            self.status = e;
         }
     }
 
@@ -1975,8 +2932,12 @@ impl App {
             FLAGS.iter().zip(self.flags).map(|((key, _), on)| (key.to_string(), if on { "on" } else { "off" }.to_string())).collect();
         more.insert("size_format".into(), self.size_format.to_string());
         more.insert("theme".into(), self.theme.to_string());
+        more.insert("accent".into(), self.accent.to_string());
         more.insert("language".into(), self.language.to_string());
         more.insert("shortcut".into(), self.shortcut_keys.clone());
+        if let Some(w) = self.column_widths {
+            more.insert("column_widths".into(), format!("{:.0},{:.0},{:.0},{:.0}", w[0], w[1], w[2], w[3]));
+        }
         let config = Config { scale, own_title_bar: self.custom_title, regex: self.regex, whole_word: self.whole_word, case, more };
         if let Err(e) = config.save() {
             self.status = format!("could not save settings: {e}");
@@ -1988,6 +2949,7 @@ impl App {
         let scale = scale.unwrap_or(self.auto_scale).clamp(0.75, 4.0);
         let Ok(mut text) = Text::load((FONT_PX * scale).round()) else { return };
         self.scale = scale;
+        self.redraw_all = true;
         self.u = (scale.round() as i32).max(1);
         self.size_w = text.width("000,000,000 KB") + 16 * self.u;
         self.date_w = text.width("0000-00-00 00:00") + 16 * self.u;
@@ -2025,8 +2987,8 @@ impl App {
     // ---- our own title bar --------------------------------------------
 
     fn title_button_at(&self, x: i32, y: i32) -> Option<usize> {
-        let (w, bw) = (self.cv.w as i32, 44 * self.u);
-        (self.custom_title && y >= 0 && y < self.title_h() && x >= w - 3 * bw && x < w).then(|| ((x - (w - 3 * bw)) / bw) as usize)
+        let (w, bw) = (self.cv.w as i32, TITLE_BUTTON * self.u);
+        (self.custom_title && y >= 0 && y < self.menu_h() && x >= w - 3 * bw && x < w).then(|| ((x - (w - 3 * bw)) / bw) as usize)
     }
 
     /// Resize direction if (x, y) is on the window's edge.
@@ -2036,6 +2998,8 @@ impl App {
         let on_frame = self.custom_title && self.title_button_at(x, y).is_none();
         if let Some(edge) = self.resize_edge(x, y).filter(|_| on_frame && !covered) {
             Cursor::Resize(edge)
+        } else if !covered && self.column_edge_at(x, y).is_some() {
+            Cursor::Resize(3) // a column edge: left-right arrows
         } else if !covered && self.tree.is_none() && y >= self.menu_h() + 6 * self.u && y < self.box_h() - 6 * self.u && x >= 6 * self.u && x < self.cv.w as i32 - 6 * self.u {
             Cursor::Text // the search box
         } else {
@@ -2064,6 +3028,205 @@ impl App {
         }
     }
 
+    /// Closes the current window as the user asked (its close button,
+    /// Alt+F4, Esc on an empty search), ending its search. Another
+    /// window is closed for good; the first hides (on Windows to the
+    /// notification area), to come back at once, empty, with the shortcut.
+    /// True if it did; else the program should exit.
+    fn dismiss(&mut self) -> bool {
+        self.menu = None;
+        if self.current != 0 {
+            self.close_current_window();
+            return true;
+        }
+        let others = self.windows.iter().skip(1).any(Option::is_some);
+        self.hidden = (self.flag(Flag::CloseToTray) || others) && self.b.hide_to_tray();
+        if self.hidden {
+            self.reset_session();
+        }
+        self.hidden
+    }
+
+    /// A new window's state: an empty search with the current options.
+    fn blank_session(&self) -> Session {
+        Session {
+            cv: Canvas::new(),
+            drag_arm: None,
+            column_drag: None,
+            query: String::new(),
+            cursor: 0,
+            anchor: 0,
+            box_scroll: 0,
+            selecting: false,
+            last_box_click: 0,
+            hits: Vec::new(),
+            sel: 0,
+            marks: BTreeSet::new(),
+            anchor_row: 0,
+            collapse_on_release: None,
+            top: 0,
+            kind: self.kind,
+            case: self.case,
+            regex: self.regex,
+            whole_word: self.whole_word,
+            query_error: None,
+            sort: self.sort,
+            reverse: self.reverse,
+            status: String::new(),
+            menu: None,
+            props: None,
+            about: false,
+            hover_button: None,
+            last_title_click: 0,
+            dragging_scrollbar: false,
+            hover_row: None,
+            results_stale: false,
+            tree_refreshed: Instant::now(),
+            last_click: (0, usize::MAX),
+            tree: None,
+            tiles: Vec::new(),
+            disks: Vec::new(),
+            tile_hover: None,
+            complete: None,
+            pending_draw: true,
+            search_pending: false,
+        }
+    }
+
+    /// The results of an empty search with the options of `blank`, from a
+    /// window that shows exactly that, if one does.
+    fn empty_results(&self, blank: &Session) -> Option<Vec<u32>> {
+        let same = |query: &str, error: &Option<String>, stale: bool, opts: (Kind, CaseMode, bool, bool, Sort, bool)| {
+            query.is_empty() && error.is_none() && !stale && opts == (blank.kind, blank.case, blank.regex, blank.whole_word, blank.sort, blank.reverse)
+        };
+        if same(&self.query, &self.query_error, self.results_stale, (self.kind, self.case, self.regex, self.whole_word, self.sort, self.reverse)) {
+            return Some(self.hits.clone());
+        }
+        self.windows
+            .iter()
+            .flatten()
+            .find(|w| same(&w.query, &w.query_error, w.results_stale, (w.kind, w.case, w.regex, w.whole_word, w.sort, w.reverse)))
+            .map(|w| w.hits.clone())
+    }
+
+    /// Ends the current window's search: it starts again empty (its size
+    /// kept).
+    fn reset_session(&mut self) {
+        let mut blank = self.blank_session();
+        std::mem::swap(&mut blank.cv, &mut self.cv);
+        self.swap_session(&mut blank);
+        self.search();
+    }
+
+    /// Makes window `n` the current one: its state moves into the fields.
+    fn switch_to(&mut self, n: u8) {
+        if n == self.current {
+            return;
+        }
+        let Some(mut s) = self.windows.get_mut(n as usize).and_then(Option::take) else { return };
+        self.swap_session(&mut s);
+        let old = self.current as usize;
+        self.windows[old] = Some(s);
+        self.current = n;
+        self.b.select(n);
+    }
+
+    /// The shortcut was pressed (or the program started again): the first
+    /// window shows if it was closed, else another window opens, each with
+    /// a search of its own.
+    fn summoned(&mut self) {
+        if self.hidden {
+            self.switch_to(0);
+            self.b.show();
+            self.hidden = false;
+            return;
+        }
+        match self.b.open_window() {
+            Ok(n) => {
+                let n = n as usize;
+                if self.windows.len() <= n {
+                    self.windows.resize_with(n + 1, || None);
+                }
+                let mut blank = self.blank_session();
+                // An empty search lists millions of entries: take the list
+                // from a window that has it rather than search again, so the
+                // window shows at once.
+                let ready = self.empty_results(&blank);
+                if let Some(hits) = &ready {
+                    blank.hits = hits.clone();
+                }
+                self.windows[n] = Some(blank);
+                self.switch_to(n as u8);
+                if ready.is_none() {
+                    self.search();
+                }
+            }
+            // A desktop that cannot open another: a fresh search here.
+            Err(_) => {
+                self.b.show();
+                self.reset_session();
+            }
+        }
+    }
+
+    /// Closes the current window (not the first) for good; the first
+    /// becomes current.
+    fn close_current_window(&mut self) {
+        let closing = self.current;
+        if closing == 0 {
+            return;
+        }
+        self.b.close_window(closing);
+        let Some(mut first) = self.windows[0].take() else { return };
+        self.swap_session(&mut first); // the closed window's state is dropped
+        self.current = 0;
+        self.b.select(0);
+        if self.windows.len() > closing as usize {
+            self.windows[closing as usize] = None;
+        }
+        self.pending_draw = true;
+    }
+
+    /// Runs `f` for every open window, each made current in turn, then
+    /// makes the original current again.
+    fn each_window(&mut self, mut f: impl FnMut(&mut App)) {
+        let start = self.current;
+        let open: Vec<u8> = (0..self.windows.len() as u8).filter(|&n| n == start || self.windows[n as usize].is_some()).collect();
+        for n in open {
+            self.switch_to(n);
+            f(self);
+        }
+        self.switch_to(start);
+    }
+
+    /// Draws every open window (after something they all show changed).
+    fn render_all(&mut self) -> io::Result<()> {
+        let mut result = Ok(());
+        self.each_window(|app| {
+            if app.current == 0 && app.hidden {
+                return;
+            }
+            if let Err(e) = app.render() {
+                result = Err(e);
+            }
+            app.pending_draw = false;
+        });
+        result
+    }
+
+    /// The index was replaced: every window searches it again.
+    fn research_all(&mut self) {
+        let current = self.current;
+        self.each_window(|app| {
+            if app.current != current {
+                let kept = app.keep_tree();
+                app.restore_tree(kept);
+                app.search();
+            }
+        });
+        self.redraw_all = true;
+    }
+
     /// A left press on the title bar or window edge; true if handled.
     fn press_frame(&mut self, x: i32, y: i32, time: u32) -> bool {
         if !self.custom_title {
@@ -2073,11 +3236,12 @@ impl App {
             match button {
                 0 => self.b.minimize(),
                 1 => self.b.toggle_maximize(),
-                _ => self.quit = true,
+                _ => self.quit = !self.dismiss(),
             }
         } else if let Some(edge) = self.resize_edge(x, y) {
             self.b.start_resize(edge);
-        } else if y < self.title_h() {
+        } else if y < self.menu_h() && self.bar_title_at(x, y).is_none() && self.bar_toggle_at(x, y).is_none() {
+            // The menu bar's empty space is the title bar: drag to move.
             if time.wrapping_sub(self.last_title_click) < 400 {
                 self.b.toggle_maximize();
             } else {
@@ -2090,20 +3254,19 @@ impl App {
         true
     }
 
+    /// Our title bar is the menu bar itself: the application icon at its
+    /// left, the window buttons at its right.
     fn draw_title_bar(&mut self) {
-        let (w, th, u) = (self.cv.w as i32, self.title_h(), self.u);
-        self.cv.fill(0, 0, w, th, 0xe6e6e6);
-        self.cv.fill(0, th - 1, w, 1, LINE);
+        let (w, th, u) = (self.cv.w as i32, self.menu_h(), self.u);
         let icon = self.icons.size as i32;
         self.icons.draw(&mut self.cv, 10 * u, (th - icon) / 2, Icon::App);
-        self.text.draw(&mut self.cv, 16 * u + icon, (th - self.text.height) / 2, "Fast search", w / 2, TEXT);
-        let bw = 44 * u;
+        let bw = TITLE_BUTTON * u;
         for button in 0..3 {
             let x = w - (3 - button) * bw;
             let hovered = self.hover_button == Some(button as usize);
-            let ink = if hovered && button == 2 { ON_ACCENT } else { 0x3a3a3a };
+            let ink = if hovered && button == 2 { ON_ACCENT } else { TEXT };
             if hovered {
-                self.cv.fill(x, 0, bw, th - 1, if button == 2 { 0xd93025 } else { 0xd2d2d2 });
+                self.cv.fill(x, 0, bw, th, if button == 2 { 0xc42b1c } else { HOVER });
             }
             // 10-unit glyphs centred in the button.
             let (gx, gy, g, t) = (x + (bw - 10 * u) / 2, (th - 10 * u) / 2, 10 * u, u.max(1));
@@ -2121,13 +3284,47 @@ impl App {
     }
 
     /// (x, width) of each menu-bar title.
-    fn bar_titles(&mut self) -> [(i32, i32); 6] {
-        let mut x = 4 * self.u;
+    fn bar_titles(&mut self) -> [(i32, i32); BAR.len()] {
+        // After the application icon when the menu bar is the title bar.
+        let mut x = if self.custom_title { 16 * self.u + self.icons.size as i32 } else { 4 * self.u };
         BAR.map(|(title, _)| {
             let w = self.text.width(tr(title)) + 18 * self.u;
             x += w;
             (x - w, w)
         })
+    }
+
+    /// Toggle buttons at the right end of the menu bar, as (x, width,
+    /// label, action): Folder sizes, and Size map while the sizes are
+    /// shown. Left out when the window is too narrow to fit them.
+    fn bar_toggles(&mut self) -> Vec<(i32, i32, &'static str, Action)> {
+        let mut buttons: Vec<(&'static str, Action)> = vec![("Folder sizes", Action::TreeSize)];
+        if self.tree.is_some() {
+            buttons.push(("Size map", Action::Toggle(Flag::SizeMap)));
+        }
+        let (u, titles_end) = (self.u, self.bar_titles().last().map_or(0, |&(x, w)| x + w));
+        // Left of the window buttons when the menu bar is the title bar.
+        let buttons_w = if self.custom_title { 3 * TITLE_BUTTON * u } else { 0 };
+        let mut x = self.cv.w as i32 - buttons_w - 6 * u;
+        let mut out = Vec::new();
+        for (label, action) in buttons.into_iter().rev() {
+            let w = self.text.width(tr(label)) + 20 * u;
+            x -= w;
+            out.push((x, w, label, action));
+            x -= 6 * u;
+        }
+        if x < titles_end + 12 * u {
+            return Vec::new();
+        }
+        out.reverse();
+        out
+    }
+
+    fn bar_toggle_at(&mut self, x: i32, y: i32) -> Option<Action> {
+        if y < self.title_h() || y >= self.menu_h() {
+            return None;
+        }
+        self.bar_toggles().into_iter().find(|&(bx, bw, _, _)| x >= bx && x < bx + bw).map(|(_, _, _, action)| action)
     }
 
     fn bar_title_at(&mut self, x: i32, y: i32) -> Option<usize> {
@@ -2140,7 +3337,11 @@ impl App {
             self.refresh_option_states();
         }
         let (x, _) = self.bar_titles()[i];
-        let items = if BAR[i].0 == "Bookmarks" { self.bookmark_menu() } else { BAR[i].1 };
+        let items = match BAR[i].0 {
+            "Bookmarks" => self.bookmark_menu(),
+            "Theme" => theme_menu(),
+            _ => BAR[i].1,
+        };
         self.menu = Some(Menu { x, y: self.menu_h(), hover: None, items, bar: Some(i) });
     }
 
@@ -2175,6 +3376,19 @@ impl App {
             return if self.sel < self.hits.len() { vec![self.sel] } else { Vec::new() };
         }
         self.marks.iter().copied().filter(|&r| r < self.hits.len()).collect()
+    }
+
+    /// An entry's path, and whether it is a whole drive (a root such as
+    /// C:\ or /): for its icon.
+    fn entry_path(&self, id: u32) -> (PathBuf, bool) {
+        let path = self.index.path(id);
+        let drive = self.index.parent(id).is_none() && path.parent().is_none();
+        (path, drive)
+    }
+
+    /// The selected rows' index entries and paths.
+    fn selected_entries(&self) -> (Vec<u32>, Vec<PathBuf>) {
+        self.selected_rows().into_iter().map(|r| (self.hits[r], self.index.path(self.hits[r]))).unzip()
     }
 
     fn selected_paths(&self) -> Vec<PathBuf> {
@@ -2328,7 +3542,7 @@ impl App {
             Key::Sym(K_END) if !ctrl => self.move_caret(self.query.len(), shift),
             Key::Sym(K_ESCAPE) => {
                 if self.query.is_empty() {
-                    return Ok(false);
+                    return Ok(self.dismiss());
                 }
                 self.clear_query();
             }
@@ -2373,6 +3587,7 @@ impl App {
             Key::Sym(K_F4) => self.act(Action::Edit, time),
             Key::Sym(K_F5) => self.reindex()?,
             Key::Sym(K_F6) => self.toggle_tree(),
+            Key::Sym(K_F7) => self.act(Action::Toggle(Flag::SizeMap), time),
             _ => {}
         }
         Ok(true)
@@ -2412,6 +3627,8 @@ impl App {
             1 if y < self.menu_h() => {
                 if let Some(title) = self.bar_title_at(x, y) {
                     self.open_bar_menu(title);
+                } else if let Some(action) = self.bar_toggle_at(x, y) {
+                    self.act(action, time);
                 }
             }
             1 if y < self.box_h() => {
@@ -2481,6 +3698,8 @@ impl App {
                 }
                 self.last_click = (time, row);
             }
+            // A column edge in the header: drag to resize.
+            1 if self.column_edge_at(x, y).is_some() => self.column_drag = self.column_edge_at(x, y),
             1 if y >= self.box_h() => {
                 // Column header: sort by it, or flip the direction.
                 let hit = self.columns().iter().rposition(|&(cx, _)| x >= cx).unwrap_or(0);
@@ -2582,14 +3801,14 @@ impl App {
         self.text.height + 6 * self.u
     }
 
-    /// Height of our own title bar (0 when the desktop draws one).
+    /// Height of a separate title bar: none, since ours is the menu bar.
     fn title_h(&self) -> i32 {
-        if self.custom_title { self.row_h() + 10 * self.u } else { 0 }
+        0
     }
 
-    /// Bottom edge of the menu bar.
+    /// Bottom edge of the menu bar, taller when it is also the title bar.
     fn menu_h(&self) -> i32 {
-        self.title_h() + self.row_h()
+        if self.custom_title { self.row_h() + 12 * self.u } else { self.row_h() }
     }
 
     /// Bottom edge of the search box area (where the column headers start).
@@ -2606,15 +3825,43 @@ impl App {
     }
 
     /// (x, width) in pixels of the Name, Path, Size and Date columns.
+    /// Until the user sizes them, Path takes the room the others leave;
+    /// after that each keeps its width, and what passes the window's
+    /// edge is cut off.
     fn columns(&self) -> [(i32, i32); 4] {
-        let avail = (self.cv.w as i32 - self.bar_w() - self.size_w - self.date_w).max(0);
-        let name = (avail * 2 / 5).max(120 * self.u);
+        let widths = match self.column_widths {
+            Some(w) => w.map(|w| (w * self.scale).round() as i32),
+            None => {
+                let avail = (self.cv.w as i32 - self.bar_w() - self.size_w - self.date_w).max(0);
+                let name = (avail * 2 / 5).max(120 * self.u);
+                [name, (avail - name).max(0), self.size_w, self.date_w]
+            }
+        };
         let mut x = 0;
-        [name, (avail - name).max(0), self.size_w, self.date_w].map(|w| {
+        widths.map(|w| {
             let col = (x, w);
             x += w;
             col
         })
+    }
+
+    /// The column edge in the header under (x, y), if any: edge `i` is
+    /// the right edge of column `i - 1` (1 after Name ... 4 after Date).
+    fn column_edge_at(&self, x: i32, y: i32) -> Option<usize> {
+        if self.tree.is_some() || y < self.box_h() || y >= self.list_top() {
+            return None;
+        }
+        let cols = self.columns();
+        (1..=4).find(|&i| (x - (cols[i - 1].0 + cols[i - 1].1)).abs() <= 6 * self.u)
+    }
+
+    /// Moves column edge `edge` to `x`: the column on its left takes the
+    /// new width and those on its right move along, keeping theirs.
+    fn drag_column(&mut self, edge: usize, x: i32) {
+        let cols = self.columns();
+        let mut widths = cols.map(|(_, w)| w);
+        widths[edge - 1] = (x - cols[edge - 1].0).max(40 * self.u);
+        self.column_widths = Some(widths.map(|w| w as f32 / self.scale));
     }
 
     /// Scrollbar (track height, thumb height) in pixels.
@@ -2648,28 +3895,45 @@ impl App {
         let (u, row_h, bar) = (self.u, self.row_h(), self.bar_w());
         let pad = 8 * u;
         let cols = self.columns();
-        self.cv.fill(0, 0, w, h, WHITE);
+        // The window base, with the results list as a lighter layer on it.
+        self.cv.fill(0, 0, w, h, PANEL);
+        self.cv.fill(0, self.box_h(), w, h - self.box_h() - row_h, palette::CARD);
+        self.cv.fill(0, self.box_h(), w, 1, LINE);
 
-        // Search box: text scrolled to keep the caret visible, selection
-        // highlighted, all clipped to the inside of the box.
+        // Search box (a Windows 11 text box: rounded, a hairline border,
+        // and an accent line along the bottom while it has the focus):
+        // text scrolled to keep the caret visible, selection highlighted,
+        // all clipped to the inside of the box.
         let top = self.menu_h();
-        self.cv.fill(0, top, w, self.box_h() - top, PANEL);
-        self.cv.fill(6 * u, top + 6 * u, w - 12 * u, row_h + 2 * u, WHITE);
-        self.cv.frame(6 * u, top + 6 * u, w - 12 * u, row_h + 2 * u, u.max(1), 0x8fb4e8);
+        let (bx, by, bw, bh) = (6 * u, top + 6 * u, w - 12 * u, row_h + 2 * u);
+        self.cv.round_frame(bx, by, bw, bh, 4 * u, u.max(1), LINE, WHITE);
+        self.cv.clip = (bx + 3 * u, bx + bw - 3 * u);
+        self.cv.fill(bx, by + bh - 2 * u, bw, 2 * u, SELECT);
+        self.cv.clip = (0, i32::MAX);
 
         // Title bar (ours) and menu bar.
         let th = self.title_h();
         if self.custom_title {
             self.draw_title_bar();
         }
-        self.cv.fill(0, th, w, top - th, WHITE);
-        self.cv.fill(0, top - 1, w, 1, LINE);
         let open = self.menu.as_ref().and_then(|m| m.bar);
         for (i, (x, tw)) in self.bar_titles().into_iter().enumerate() {
             if open == Some(i) {
-                self.cv.fill(x, th, tw, top - 1 - th, HOVER);
+                self.cv.round(x + 2 * u, th + 2 * u, tw - 4 * u, top - th - 4 * u, 4 * u, palette::PICKED);
             }
-            self.text.draw(&mut self.cv, x + 9 * u, th + 3 * u, tr(BAR[i].0), tw, TEXT);
+            self.text.draw(&mut self.cv, x + 9 * u, (top - self.text.height) / 2, tr(BAR[i].0), tw, TEXT);
+        }
+        for (x, bw, label, action) in self.bar_toggles() {
+            let bh = row_h - 5 * u;
+            let y = (top - bh) / 2;
+            let on = self.checked(action);
+            if on {
+                self.cv.round(x, y, bw, bh, 4 * u, SELECT);
+            } else {
+                self.cv.round_frame(x, y, bw, bh, 4 * u, u.max(1), LINE, WHITE);
+            }
+            let ty = y + (bh - self.text.height) / 2;
+            self.text.draw(&mut self.cv, x + 10 * u, ty, tr(label), bw, if on { ON_ACCENT } else { TEXT });
         }
         if self.tree.is_some() {
             self.draw_tree();
@@ -2694,17 +3958,20 @@ impl App {
             self.cv.fill(tx + caret, ty, u.max(1), self.text.height, TEXT);
             self.cv.clip = (0, i32::MAX);
 
-            // Column headers with the sort direction.
+            // Columns sized wider than the window are cut off before the
+            // scrollbar.
+            self.cv.clip = (0, w - bar);
+            // Column headers with the sort direction, quiet, on the list.
             let y = self.box_h();
-            self.cv.fill(0, y, w, row_h, PANEL);
-            self.cv.fill(0, y + row_h, w, 1, LINE);
+            self.cv.fill(pad, y + row_h, w - 2 * pad, 1, LINE);
             let heads = [("Name", Sort::Name), ("Path", Sort::Path), ("Size", Sort::Size), ("Modified", Sort::Mtime)];
             for (i, ((label, sort), (x, cw))) in heads.into_iter().zip(cols).enumerate() {
                 let mark = if self.sort != sort { "" } else if self.reverse { "  ▼" } else { "  ▲" };
                 if i > 0 {
-                    self.cv.fill(x, y + 4 * u, 1, row_h - 8 * u, LINE);
+                    self.cv.fill(x, y + 6 * u, 1, row_h - 12 * u, LINE);
                 }
-                self.text.draw(&mut self.cv, x + pad, y + 3 * u, &format!("{}{mark}", tr(label)), cw - 2 * pad, TEXT);
+                let ink = if self.sort == sort { TEXT } else { DIM };
+                self.text.draw(&mut self.cv, x + pad, y + 3 * u, &format!("{}{mark}", tr(label)), cw - 2 * pad, ink);
             }
 
             // Result rows.
@@ -2716,13 +3983,15 @@ impl App {
                 let Some(&id) = self.hits.get(self.top + row) else { break };
                 let y = list_top + row as i32 * row_h;
                 let selected = self.is_selected(self.top + row);
+                // Selected rows: filled across in the accent colour, with
+                // white text; the row under the pointer: a rounded tint.
                 let (fg, dim) = if selected { (ON_ACCENT, ON_ACCENT) } else { (TEXT, DIM) };
                 if selected {
                     self.cv.fill(0, y, w - bar, row_h, SELECT);
                 } else if self.hover_row == Some(self.top + row) {
-                    self.cv.fill(0, y, w - bar, row_h, 0xe6f0fc);
+                    self.cv.round(4 * u, y + u, w - bar - 6 * u, row_h - 2 * u, 4 * u, HOVER);
                 } else if self.flag(Flag::AltRows) && (self.top + row) % 2 == 1 {
-                    self.cv.fill(0, y, w - bar, row_h, 0xf5f7f9);
+                    self.cv.fill(0, y, w - bar, row_h, 0xf6f6f6);
                 }
                 let is_dir = self.index.is_dir(id);
                 let name = String::from_utf8_lossy(self.index.name(id)).into_owned();
@@ -2733,8 +4002,10 @@ impl App {
                     }
                     None => String::new(),
                 };
-                let kind = Icon::of(self.index.name(id), is_dir, self.index.is_symlink(id));
-                self.icons.draw(&mut self.cv, cols[0].0 + pad, y + (row_h - icon) / 2, kind);
+                let (entry_path, drive) = self.entry_path(id);
+                let system = self.flag(Flag::SystemIcons);
+                let entry_name = self.index.name(id);
+                self.icons.draw_entry(&mut self.cv, cols[0].0 + pad, y + (row_h - icon) / 2, entry_name, is_dir, self.index.is_symlink(id), &entry_path, drive, system);
                 let ty = y + 3 * u;
                 let name_x = cols[0].0 + pad + icon + 6 * u;
                 self.text.draw(&mut self.cv, name_x, ty, &name, cols[0].0 + cols[0].1 - pad - name_x, fg);
@@ -2749,12 +4020,14 @@ impl App {
                 self.text.draw(&mut self.cv, cols[3].0 + pad, ty, &date, cols[3].1 - pad, dim);
             }
 
+            self.cv.clip = (0, i32::MAX);
             // Scrollbar.
             if self.hits.len() > rows {
                 let (track, thumb) = self.scrollbar();
                 let pos = ((track - thumb) as i64 * self.top as i64 / self.max_top().max(1) as i64) as i32;
-                self.cv.fill(w - bar, list_top, bar, track, PANEL);
-                self.cv.fill(w - bar + 2 * u, list_top + pos, bar - 4 * u, thumb, 0xa6a6a6);
+                // A thin rounded thumb, as Windows 11 draws scrollbars.
+                let tw = 4 * u;
+                self.cv.round(w - bar + (bar - tw) / 2, list_top + pos + 2 * u, tw, thumb - 4 * u, tw / 2, palette::QUIET);
             }
         }
 
@@ -2762,7 +4035,10 @@ impl App {
         let y = h - row_h;
         self.cv.fill(0, y, w, row_h, PANEL);
         self.cv.fill(0, y, w, 1, LINE);
-        let status = if self.status.is_empty() && self.tree.is_some() {
+        let progress = self.build_status();
+        let status = if let Some((text, _)) = &progress {
+            text.clone()
+        } else if self.status.is_empty() && self.tree.is_some() {
             self.tree_status()
         } else if self.status.is_empty() {
             let kind = tr(["all", "files", "folders"][self.kind as usize]);
@@ -2802,7 +4078,28 @@ impl App {
             self.status.clone()
         };
         let grip = if self.custom_title { GRIP * u } else { 0 };
-        self.text.draw(&mut self.cv, pad, y + 3 * u, &status, w - 2 * pad - grip, TEXT);
+        // While indexing, a progress bar at the right end: filled to the
+        // share done when the size is known, else a block sweeping across.
+        let mut text_room = w - 2 * pad - grip;
+        if let Some((_, share)) = progress {
+            let (bw, bh) = (220 * u, row_h - 10 * u);
+            if w > 3 * bw {
+                let (bx, by) = (w - pad - grip - bw, y + 5 * u);
+                self.cv.fill(bx, by, bw, bh, LINE);
+                match share {
+                    Some(share) => self.cv.fill(bx, by, (bw as f64 * share) as i32, bh, SELECT),
+                    None => {
+                        let span = bw / 4;
+                        let t = self.building.as_ref().map_or(0, |b| b.started.elapsed().as_millis() as i32);
+                        let x = (t / 4) % (bw + span) - span;
+                        let (from, to) = (x.max(0), (x + span).min(bw));
+                        self.cv.fill(bx + from, by, (to - from).max(0), bh, SELECT);
+                    }
+                }
+                text_room -= bw + pad;
+            }
+        }
+        self.text.draw(&mut self.cv, pad, y + 3 * u, &status, text_room, TEXT);
         // The resize grip: dots in a triangle in the corner.
         if self.custom_title {
             let dot = ((2.0 * self.scale).round() as i32).max(2);
@@ -2826,7 +4123,10 @@ impl App {
             self.draw_about();
         }
         if self.custom_title {
-            self.cv.frame(0, 0, w, h, 1, 0x8c8c8c); // the window's own border
+            // The window's own border (Windows draws one itself).
+            if cfg!(not(windows)) {
+                self.cv.frame(0, 0, w, h, 1, 0x8c8c8c);
+            }
         }
         self.present()
     }
@@ -2843,8 +4143,10 @@ impl App {
             return self.on_tree_target(|app| app.refusal(action)).flatten();
         }
         // A huge selection is not checked to the end: what cannot be
-        // done is then reported when it is tried.
-        let blocked = self.selected_rows().into_iter().take(200).any(|row| {
+        // done is then reported when it is tried. On Windows a check
+        // opens the file, so only the first is looked at.
+        let checked = if cfg!(windows) { 1 } else { 200 };
+        let blocked = self.selected_rows().into_iter().take(checked).any(|row| {
             let path = self.index.path(self.hits[row]);
             if delete { !may_delete(&path) } else { !may_read(&path) }
         });
@@ -2858,15 +4160,15 @@ impl App {
     fn draw_menu(&mut self, menu: &Menu) {
         let (u, row_h) = (self.u, self.row_h());
         let (x, y, w, h) = self.menu_rect(menu);
-        self.cv.fill(x + 3 * u, y + 3 * u, w, h, 0xbdbdbd); // shadow
-        self.cv.fill(x, y, w, h, WHITE);
-        self.cv.frame(x, y, w, h, u.max(1), 0x9a9a9a);
+        // A Windows 11 flyout: rounded, a hairline border, a soft shadow.
+        self.cv.round(x + u, y + 2 * u, w, h, 8 * u, 0xd6d6d6);
+        self.cv.round_frame(x, y, w, h, 8 * u, u.max(1), 0xd0d0d0, WHITE);
         for (i, (label, shortcut, action)) in menu.items.iter().enumerate() {
             let iy = y + 4 * u + i as i32 * row_h;
             // Entries the user has no permission for are greyed.
             let off = self.refusal(*action).is_some();
             if menu.hover == Some(i) && !off {
-                self.cv.fill(x + u, iy, w - 2 * u, row_h, HOVER);
+                self.cv.round(x + 4 * u, iy + u, w - 8 * u, row_h - 2 * u, 4 * u, HOVER);
             }
             // A bullet marks active choices and switched-on options.
             if self.checked(*action) {
@@ -2908,7 +4210,7 @@ impl App {
         let (cw, ch) = (self.cv.w as i32, self.cv.h as i32);
         let lines = [
             ("Fast search".to_string(), TEXT),
-            (trf("Version {}", &[&env!("CARGO_PKG_VERSION")]), DIM),
+            (trf("Version {}", &[&ff_core::update::VERSION]), DIM),
             (String::new(), DIM),
             (tr("Instant file search for Linux").to_string(), TEXT),
             (trf("{} files and folders indexed", &[&group_digits(self.index.len() as u64)]), TEXT),
@@ -2934,11 +4236,11 @@ impl App {
 
     /// Shows the frame in the main window.
     fn present(&mut self) -> io::Result<()> {
-        self.b.present(Win::Main, &self.cv)
+        self.b.present(Win::Main(self.current), &self.cv)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
@@ -2975,4 +4277,28 @@ mod tests {
         mode(&dir.join("locked"), 0o755);
         std::fs::remove_dir_all(&dir).unwrap();
     }
+}
+
+#[cfg(test)]
+mod portable_tests {
+    use super::trim_folder;
+
+    #[test]
+    fn typed_folders_lose_trailing_separators_but_roots_stay_whole() {
+        assert_eq!(trim_folder("/home/me/Videos/"), "/home/me/Videos");
+        assert_eq!(trim_folder("/"), "/");
+        if cfg!(windows) {
+            assert_eq!(trim_folder(r"C:\Users\me\"), r"C:\Users\me");
+            assert_eq!(trim_folder(r"C:\"), r"C:\");
+        }
+    }
+}
+
+/// What a background delete reports back.
+struct Deleted {
+    ids: Vec<u32>,
+    paths: Vec<PathBuf>,
+    trash: bool,
+    /// What went wrong, or that the user cancelled; None if all went.
+    problem: Option<String>,
 }

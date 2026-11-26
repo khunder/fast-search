@@ -6,8 +6,13 @@
 //! the picked paths can be captured: `vim "$(ff -i)"`.
 
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
+#[cfg(unix)]
+use std::io::Read;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant, SystemTime};
@@ -56,6 +61,7 @@ pub fn run(db: PathBuf, index: Index, start: Start) -> Result<ExitCode, String> 
 
 // ---- the terminal -----------------------------------------------------------
 
+#[cfg(unix)]
 mod sys {
     use std::ffi::{c_int, c_short, c_ulong};
 
@@ -89,7 +95,6 @@ mod sys {
         pub fn kill(pid: c_int, signal: c_int) -> c_int;
         pub fn getpid() -> c_int;
         pub fn signal(signal: c_int, handler: usize) -> usize;
-        pub fn isatty(fd: c_int) -> c_int;
     }
 
     pub const SIGINT: c_int = 2;
@@ -103,10 +108,109 @@ mod sys {
     pub const SIGTSTP: c_int = 20;
 }
 
+/// The Windows console, driven with the same escape sequences: Windows 10
+/// and later understand them once "virtual terminal" mode is on, in both
+/// directions (keys and mouse clicks then arrive as escape sequences too).
+#[cfg(windows)]
+mod sys {
+    #![allow(non_snake_case)]
+    use std::ffi::c_void;
+
+    pub type Handle = *mut c_void;
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct Coord {
+        pub x: i16,
+        pub y: i16,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct SmallRect {
+        pub left: i16,
+        pub top: i16,
+        pub right: i16,
+        pub bottom: i16,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct ScreenBufferInfo {
+        pub size: Coord,
+        pub cursor: Coord,
+        pub attributes: u16,
+        pub window: SmallRect,
+        pub max_size: Coord,
+    }
+
+    /// An `INPUT_RECORD`, with the event read as a key event (the only
+    /// kind whose fields we look at).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct InputRecord {
+        pub event_type: u16,
+        pub _pad: u16,
+        pub key_down: i32,
+        pub repeat: u16,
+        pub vk: u16,
+        pub scan: u16,
+        pub ch: u16,
+        pub control: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn GetConsoleMode(h: Handle, mode: *mut u32) -> i32;
+        pub fn SetConsoleMode(h: Handle, mode: u32) -> i32;
+        pub fn GetConsoleOutputCP() -> u32;
+        pub fn SetConsoleOutputCP(cp: u32) -> i32;
+        pub fn GetConsoleScreenBufferInfo(h: Handle, info: *mut ScreenBufferInfo) -> i32;
+        pub fn WaitForSingleObject(h: Handle, ms: u32) -> u32;
+        pub fn PeekConsoleInputW(h: Handle, buf: *mut InputRecord, len: u32, read: *mut u32) -> i32;
+        pub fn ReadConsoleInputW(h: Handle, buf: *mut InputRecord, len: u32, read: *mut u32) -> i32;
+        pub fn ReadConsoleW(h: Handle, buf: *mut u16, len: u32, read: *mut u32, control: *const c_void) -> i32;
+        pub fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
+    }
+
+    pub const ENABLE_PROCESSED_INPUT: u32 = 0x1;
+    pub const ENABLE_LINE_INPUT: u32 = 0x2;
+    pub const ENABLE_ECHO_INPUT: u32 = 0x4;
+    pub const ENABLE_WINDOW_INPUT: u32 = 0x8;
+    pub const ENABLE_MOUSE_INPUT: u32 = 0x10;
+    pub const ENABLE_QUICK_EDIT_MODE: u32 = 0x40;
+    pub const ENABLE_EXTENDED_FLAGS: u32 = 0x80;
+    pub const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x200;
+    pub const ENABLE_PROCESSED_OUTPUT: u32 = 0x1;
+    pub const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x4;
+    pub const DISABLE_NEWLINE_AUTO_RETURN: u32 = 0x8;
+    pub const KEY_EVENT: u16 = 1;
+    pub const WAIT_OBJECT_0: u32 = 0;
+    pub const CP_UTF8: u32 = 65001;
+
+    /// A console control handler that swallows Ctrl+C: while an editor
+    /// runs in the console, Ctrl+C is meant for it, not for us.
+    pub unsafe extern "system" fn ignore_ctrl_c(_: u32) -> i32 {
+        1
+    }
+}
+
 struct Term {
+    /// Where the screen is drawn: `/dev/tty`, or the Windows console's
+    /// output (`CONOUT$`), so standard output stays free for the result.
     tty: File,
+    /// The console's input (`CONIN$`); on Unix `tty` serves both ways.
+    #[cfg(windows)]
+    conin: File,
     /// The settings to put back when we leave.
+    #[cfg(unix)]
     saved: sys::Termios,
+    /// Input mode, output mode and output code page to put back.
+    #[cfg(windows)]
+    saved: (u32, u32, u32),
+    /// The first half of a UTF-16 surrogate pair, until the second comes.
+    #[cfg(windows)]
+    high_surrogate: Option<u16>,
     /// Bytes read but not yet turned into keys.
     input: Vec<u8>,
     /// The bytes of the last key we could not make sense of.
@@ -114,6 +218,7 @@ struct Term {
     active: bool,
 }
 
+#[cfg(unix)]
 impl Term {
     fn open() -> io::Result<Term> {
         let tty = std::fs::OpenOptions::new()
@@ -175,6 +280,133 @@ impl Term {
         Ok(n > 0)
     }
 
+    /// Standard handles for a program that takes over the terminal.
+    fn child_stdio(&self) -> io::Result<(Stdio, Stdio, Stdio)> {
+        let tty = |t: &File| t.try_clone().map(Stdio::from);
+        Ok((tty(&self.tty)?, tty(&self.tty)?, tty(&self.tty)?))
+    }
+}
+
+#[cfg(windows)]
+impl Term {
+    fn open() -> io::Result<Term> {
+        let no_console = |_| io::Error::other("ff -i needs a console to draw on");
+        let console = |name| std::fs::OpenOptions::new().read(true).write(true).open(name).map_err(no_console);
+        let tty = console("CONOUT$")?;
+        let conin = console("CONIN$")?;
+        let (mut input_mode, mut output_mode) = (0, 0);
+        // SAFETY: valid console handles and out-pointers.
+        let ok = unsafe {
+            sys::GetConsoleMode(conin.as_raw_handle(), &mut input_mode) != 0
+                && sys::GetConsoleMode(tty.as_raw_handle(), &mut output_mode) != 0
+        };
+        if !ok {
+            return Err(io::Error::other("ff -i needs a console to draw on"));
+        }
+        // SAFETY: no arguments.
+        let code_page = unsafe { sys::GetConsoleOutputCP() };
+        let saved = (input_mode, output_mode, code_page);
+        let mut term = Term { tty, conin, saved, high_surrogate: None, input: Vec::new(), unknown: Vec::new(), active: false };
+        term.enter()?;
+        Ok(term)
+    }
+
+    /// Raw keys as escape sequences, our own screen, mouse clicks and the
+    /// wheel, UTF-8 output.
+    fn enter(&mut self) -> io::Result<()> {
+        use sys::*;
+        let input = (self.saved.0
+            & !(ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_MOUSE_INPUT | ENABLE_QUICK_EDIT_MODE))
+            | ENABLE_VIRTUAL_TERMINAL_INPUT
+            | ENABLE_WINDOW_INPUT
+            | ENABLE_EXTENDED_FLAGS;
+        let output = self.saved.1 | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
+        // SAFETY: valid console handles.
+        let ok = unsafe {
+            SetConsoleMode(self.conin.as_raw_handle(), input) != 0
+                && SetConsoleMode(self.tty.as_raw_handle(), output) != 0
+                && SetConsoleOutputCP(CP_UTF8) != 0
+        };
+        if !ok {
+            self.restore();
+            return Err(io::Error::other("this console does not understand escape sequences (Windows 10 or later is needed)"));
+        }
+        self.tty.write_all(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?7l")?;
+        self.active = true;
+        Ok(())
+    }
+
+    fn restore(&mut self) {
+        // SAFETY: valid console handles; the values were read at start.
+        unsafe {
+            sys::SetConsoleMode(self.conin.as_raw_handle(), self.saved.0);
+            sys::SetConsoleMode(self.tty.as_raw_handle(), self.saved.1);
+            sys::SetConsoleOutputCP(self.saved.2);
+        }
+    }
+
+    fn leave(&mut self) {
+        if std::mem::take(&mut self.active) {
+            let _ = self.tty.write_all(b"\x1b[?7h\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l");
+            self.restore();
+        }
+    }
+
+    /// (rows, columns) of the visible window.
+    fn size(&self) -> (usize, usize) {
+        let mut info = sys::ScreenBufferInfo::default();
+        // SAFETY: a valid console handle and out-pointer.
+        let ok = unsafe { sys::GetConsoleScreenBufferInfo(self.tty.as_raw_handle(), &mut info) } != 0;
+        let rows = (info.window.bottom - info.window.top + 1) as usize;
+        let cols = (info.window.right - info.window.left + 1) as usize;
+        if ok && rows > 0 && cols > 0 { (rows, cols) } else { (24, 80) }
+    }
+
+    /// Reads what has arrived, waiting at most `wait`; false if nothing did.
+    fn fill(&mut self, wait: Duration) -> io::Result<bool> {
+        let h = self.conin.as_raw_handle();
+        let ms = wait.as_millis().min(u32::MAX as u128 - 1) as u32;
+        // SAFETY: a valid console input handle.
+        if unsafe { sys::WaitForSingleObject(h, ms) } != sys::WAIT_OBJECT_0 {
+            return Ok(false);
+        }
+        // Something is waiting, but maybe only focus or resize events,
+        // which reading text would block on: those are taken off here.
+        let mut records = [sys::InputRecord::default(); 64];
+        let mut n = 0;
+        // SAFETY: the buffer holds `records.len()` records.
+        if unsafe { sys::PeekConsoleInputW(h, records.as_mut_ptr(), records.len() as u32, &mut n) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let typed = records[..n as usize].iter().any(|r| r.event_type == sys::KEY_EVENT && r.key_down != 0 && r.ch != 0);
+        if !typed {
+            // SAFETY: as above; reads exactly the records just seen.
+            unsafe { sys::ReadConsoleInputW(h, records.as_mut_ptr(), n, &mut n) };
+            return Ok(false); // a resize: the next draw picks up the size
+        }
+        let mut buf = [0u16; 2048];
+        let mut got = 0;
+        // SAFETY: the buffer holds `buf.len()` UTF-16 units.
+        if unsafe { sys::ReadConsoleW(h, buf.as_mut_ptr(), buf.len() as u32, &mut got, std::ptr::null()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut units: Vec<u16> = self.high_surrogate.take().into_iter().collect();
+        units.extend_from_slice(&buf[..got as usize]);
+        if units.last().is_some_and(|u| (0xD800..0xDC00).contains(u)) {
+            self.high_surrogate = units.pop();
+        }
+        self.input.extend_from_slice(String::from_utf16_lossy(&units).as_bytes());
+        Ok(!units.is_empty())
+    }
+
+    /// Standard handles for a program that takes over the console.
+    fn child_stdio(&self) -> io::Result<(Stdio, Stdio, Stdio)> {
+        let clone = |t: &File| t.try_clone().map(Stdio::from);
+        Ok((clone(&self.conin)?, clone(&self.tty)?, clone(&self.tty)?))
+    }
+}
+
+impl Term {
     /// The next key, waiting at most `wait` for one.
     fn next_key(&mut self, wait: Duration) -> io::Result<Option<Key>> {
         loop {
@@ -438,14 +670,11 @@ fn base64(data: &[u8]) -> String {
     out
 }
 
-/// A bar of `w` cells filled to `fraction`, with eighths at its end.
-fn bar(fraction: f64, w: usize) -> String {
-    let eighths = (fraction.clamp(0.0, 1.0) * (w * 8) as f64).round() as usize;
-    let mut out = "█".repeat(eighths / 8);
-    if eighths % 8 > 0 {
-        out.push([' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'][eighths % 8]);
-    }
-    pad(&out, w)
+/// How many of `w` cells a bar filled to `fraction` covers. Bars are drawn in
+/// whole cells of `▆`, lower than the row, so bars on rows above each other
+/// keep a gap between them (eighths of a cell would fill the row's height).
+fn bar(fraction: f64, w: usize) -> usize {
+    (fraction.clamp(0.0, 1.0) * w as f64).round() as usize
 }
 
 // ---- the interface --------------------------------------------------------------
@@ -463,6 +692,11 @@ struct Paint {
     dim: &'static str,
     accent: &'static str,
     error: &'static str,
+    /// Share bars: the filled part, the same for a nearly full disk, and
+    /// the empty rest of the track (grey).
+    bar: &'static str,
+    full: &'static str,
+    track: &'static str,
 }
 
 struct Complete {
@@ -484,7 +718,14 @@ const HELP: &[(&str, &str)] = &[
     ("Alt+P", "print the selected paths and quit"),
     ("Tab, Shift+Tab", "mark several results; Enter and the keys below act on all of them"),
     ("Ctrl+O", "open with the default application"),
-    ("F4, Alt+E", "edit in $VISUAL or $EDITOR (else vi), in this terminal"),
+    (
+        "F4, Alt+E",
+        if cfg!(windows) {
+            "edit in %VISUAL% or %EDITOR% (else Notepad)"
+        } else {
+            "edit in $VISUAL or $EDITOR (else vi), in this terminal"
+        },
+    ),
     ("Alt+S", "edit with sudoedit; Enter and F4 do that for files you cannot change"),
     ("", "(if sudo is refused, the file opens read-only)"),
     ("Ctrl+G", "show in the file manager"),
@@ -529,6 +770,9 @@ struct Ui {
     note: Option<(String, Instant)>,
     complete: Option<Complete>,
     tree: Option<Tree>,
+    /// Per root of the folder sizes tree: its drive's capacity and free
+    /// space, where known.
+    disks: Vec<(u32, (u64, u64))>,
     /// A panel over the list (help, properties): its title and lines.
     panel: Option<(String, Vec<(String, String)>)>,
     bookmarks: Vec<Bookmark>,
@@ -546,9 +790,19 @@ impl Ui {
     fn new(term: Term, db: PathBuf, stamp: Option<SystemTime>, index: Index, start: Start) -> Ui {
         let plain = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
         let paint = if plain {
-            Paint { folder: "", link: "", dim: "", accent: "", error: "" }
+            Paint { folder: "", link: "", dim: "", accent: "", error: "", bar: "", full: "", track: "" }
         } else {
-            Paint { folder: "\x1b[1;34m", link: "\x1b[36m", dim: "\x1b[2m", accent: "\x1b[1;33m", error: "\x1b[1;31m" }
+            Paint {
+                folder: "\x1b[1;34m",
+                link: "\x1b[36m",
+                dim: "\x1b[2m",
+                accent: "\x1b[1;33m",
+                error: "\x1b[1;31m",
+                // 256-colour blue, and a red of the same tone, on dark grey.
+                bar: "\x1b[38;5;33m",
+                full: "\x1b[38;5;167m",
+                track: "\x1b[38;5;238m",
+            }
         };
         let sort = SORTS.iter().position(|(s, r, _)| *s == start.sort && *r == start.reverse).unwrap_or(0);
         let cursor = start.query.len();
@@ -577,6 +831,7 @@ impl Ui {
             note: None,
             complete: None,
             tree: None,
+            disks: Vec::new(),
             panel: None,
             bookmarks: ff_core::bookmarks::load(),
             last_click: (Instant::now(), usize::MAX),
@@ -584,8 +839,8 @@ impl Ui {
             size,
             paint,
             null: start.null,
-            // SAFETY: isatty only looks at the descriptor.
-            capture: unsafe { sys::isatty(1) } == 0,
+            // Standard output captured, as in `vim "$(ff -i)"`.
+            capture: !std::io::IsTerminal::is_terminal(&io::stdout()),
         }
     }
 
@@ -792,7 +1047,7 @@ impl Ui {
     /// The keys that act on files, the same in both views.
     fn action_key(&mut self, key: Key) -> io::Result<Option<End>> {
         let Some(&id) = self.targets().first() else { return Ok(None) };
-        let path = PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(self.path(id)));
+        let path = PathBuf::from(ff_core::os::os_string_from_vec(self.path(id)));
         match key {
             Key::Ctrl('o') => match desktop() {
                 true => self.done(ff_core::desktop::open(&path), &path, "Opened"),
@@ -849,7 +1104,7 @@ impl Ui {
     }
 
     fn target_paths(&self) -> Vec<PathBuf> {
-        self.targets().into_iter().map(|id| PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(self.path(id)))).collect()
+        self.targets().into_iter().map(|id| PathBuf::from(ff_core::os::os_string_from_vec(self.path(id)))).collect()
     }
 
     fn pick(&self) -> Option<End> {
@@ -987,9 +1242,10 @@ impl Ui {
         if paths.is_empty() {
             return Ok(());
         }
-        let editor = ["VISUAL", "EDITOR"].iter().find_map(|v| std::env::var(v).ok().filter(|e| !e.trim().is_empty())).unwrap_or_else(|| "vi".into());
+        let editor = ["VISUAL", "EDITOR"].iter().find_map(|v| std::env::var(v).ok().filter(|e| !e.trim().is_empty())).unwrap_or_else(|| DEFAULT_EDITOR.into());
         let all_files = paths.iter().all(|p| p.symlink_metadata().is_ok_and(|m| !m.is_dir()));
-        let sudo = all_files && (force_sudo || paths.iter().any(|p| !may(p, 2)));
+        // Windows has no sudoedit: a file the user may not change opens anyway.
+        let sudo = cfg!(unix) && all_files && (force_sudo || paths.iter().any(|p| !may(p, 2)));
         let stamp = |p: &PathBuf| std::fs::metadata(p).ok().map(|m| (m.modified().ok(), m.len()));
         let before: Vec<_> = paths.iter().map(stamp).collect();
         let what = if paths.len() == 1 { paths[0].display().to_string() } else { format!("{} files", paths.len()) };
@@ -1037,37 +1293,26 @@ impl Ui {
         if !notice.is_empty() {
             let _ = writeln!(self.term.tty, "{notice}\r");
         }
-        let tty = |t: &File| t.try_clone().map(Stdio::from);
-        command.stdin(tty(&self.term.tty)?).stdout(tty(&self.term.tty)?).stderr(tty(&self.term.tty)?);
-        // Ctrl+C at the password prompt, or in the editor, is meant for
-        // them: like system(3), we ignore it while they run, and they get
-        // the usual handling back.
-        use std::os::unix::process::CommandExt;
-        // SAFETY: signal() is async-signal-safe, as pre_exec requires.
-        unsafe {
-            command.pre_exec(|| {
-                sys::signal(sys::SIGINT, sys::SIG_DFL);
-                sys::signal(sys::SIGQUIT, sys::SIG_DFL);
-                Ok(())
-            });
-        }
-        // SAFETY: setting and restoring dispositions; no handler code runs.
-        let saved = unsafe { (sys::signal(sys::SIGINT, sys::SIG_IGN), sys::signal(sys::SIGQUIT, sys::SIG_IGN)) };
-        let status = command.status();
-        unsafe {
-            sys::signal(sys::SIGINT, saved.0);
-            sys::signal(sys::SIGQUIT, saved.1);
-        }
+        let (stdin, stdout, stderr) = self.term.child_stdio()?;
+        command.stdin(stdin).stdout(stdout).stderr(stderr);
+        let status = run_ignoring_ctrl_c(command);
         self.term.enter()?;
         Ok(status)
     }
 
     /// Ctrl+Z: back to the shell; `fg` brings the screen back.
+    #[cfg(unix)]
     fn suspend(&mut self) {
         self.term.leave();
         // SAFETY: stopping ourselves; execution resumes here on SIGCONT.
         unsafe { sys::kill(sys::getpid(), sys::SIGTSTP) };
         let _ = self.term.enter();
+    }
+
+    /// Windows consoles have no job control to go back to.
+    #[cfg(windows)]
+    fn suspend(&mut self) {
+        self.note("Ctrl+Z does nothing here: Windows consoles cannot suspend a program".to_string());
     }
 
     // ---- folder sizes ---------------------------------------------------------------
@@ -1080,6 +1325,8 @@ impl Ui {
             }
         }
         self.tree = Some(tree);
+        let index = &self.index;
+        self.disks = index.roots().filter_map(|r| ff_core::os::disk_space(&index.path(r)).map(|d| (r, d))).collect();
     }
 
     fn tree_key(&mut self, key: Key) -> io::Result<Option<End>> {
@@ -1129,13 +1376,15 @@ impl Ui {
 
     fn tree_mouse(&mut self, button: u16, x: usize, y: usize) {
         let body = self.body_rows();
+        // Rows start below the title, and below the column names when shown.
+        let first = 1 + (body > 3) as usize;
         let Some(tree) = self.tree.as_mut() else { return };
         let last = tree.rows.len().saturating_sub(1);
         match button {
             64 => tree.sel = tree.sel.saturating_sub(3),
             65 => tree.sel = (tree.sel + 3).min(last),
-            0 if y >= 1 && y <= body => {
-                let row = tree.top + y - 1;
+            0 if y >= first && y <= body => {
+                let row = tree.top + y - first;
                 let Some(node) = tree.rows.get(row) else { return };
                 let on_arrow = x >= 2 + 2 * node.depth as usize && x < 4 + 2 * node.depth as usize;
                 let double = self.last_click.1 == row && self.last_click.0.elapsed() < Duration::from_millis(400);
@@ -1260,17 +1509,45 @@ impl Ui {
     }
 
     fn tree_lines(&mut self, body: usize, cols: usize, lines: &mut Vec<String>) {
-        let Some(tree) = self.tree.as_mut() else { return };
-        tree.sel = tree.sel.min(tree.rows.len().saturating_sub(1));
-        if tree.sel < tree.top {
-            tree.top = tree.sel;
-        } else if tree.sel >= tree.top + body {
-            tree.top = tree.sel + 1 - body;
+        // Columns from the right, as the width allows: size; files and
+        // folders; the share of the parent and of the disk, each a bar
+        // with its figure; the space left on a drive.
+        let (counts, parent, disk) = (cols >= 72, cols >= 56, cols >= 96 && !self.disks.is_empty());
+        let free = disk && cols >= 106;
+        // One more for the last column, which stays empty: writing there
+        // makes terminals wrap the line.
+        let right = 11 + if counts { 14 } else { 0 } + if parent { 16 } else { 0 } + if disk { 17 } else { 0 } + if free { 10 } else { 0 };
+        // A line naming the columns, when there is room for rows below it.
+        let header = body > 3;
+        let rows = body - header as usize;
+        {
+            let Some(tree) = self.tree.as_mut() else { return };
+            tree.sel = tree.sel.min(tree.rows.len().saturating_sub(1));
+            if tree.sel < tree.top {
+                tree.top = tree.sel;
+            } else if tree.sel >= tree.top + rows {
+                tree.top = tree.sel + 1 - rows;
+            }
         }
-        let tree = &*tree;
-        let (full, medium) = (cols >= 80, cols >= 50);
-        let right = if full { 41 } else if medium { 18 } else { 10 };
-        for row in tree.top..(tree.top + body).min(tree.rows.len()) {
+        let Some(tree) = self.tree.as_ref() else { return };
+        if header {
+            let mut line = format!("\x1b[0m{}  {}", self.paint.dim, pad("Name", cols.saturating_sub(right + 2)));
+            line.push_str(&format!("{:>9} ", "Size"));
+            if counts {
+                line.push_str(&format!("{:>6} {:>6} ", "Files", "Dirs"));
+            }
+            if parent {
+                line.push_str(&format!(" {:<15}", "% of parent"));
+            }
+            if disk {
+                line.push_str(&format!("  {:<15}", "% of disk"));
+            }
+            if free {
+                line.push_str(&format!("{:>10}", "Free"));
+            }
+            lines.push(line);
+        }
+        for row in tree.top..(tree.top + rows).min(tree.rows.len()) {
             let node = &tree.rows[row];
             let id = node.id;
             let base = if row == tree.sel { "\x1b[0;7m" } else { "\x1b[0m" };
@@ -1283,19 +1560,69 @@ impl Ui {
             let mut line = format!("{base}  {indent}{}{arrow}{base}{colour}{name}{base}", self.paint.dim);
             let used = 2 + indent.len() + 2 + width(&name);
             line.push_str(&" ".repeat(cols.saturating_sub(right).saturating_sub(used)));
-            let of = self.index.parent(id).map_or(tree.total(id), |p| tree.total(p));
-            let share = if of == 0 { 0.0 } else { tree.total(id) as f64 / of as f64 };
-            let size = human_size(tree.total(id));
-            if full {
-                let files = if is_dir { group_digits(tree.files(id) as u64) } else { String::new() };
-                line.push_str(&format!("{}{}{base} {size:>9} {files:>11} {:>6.1}% ", self.paint.accent, bar(share, 10), share * 100.0));
-            } else if medium {
-                line.push_str(&format!("{size:>9} {:>6.1}% ", share * 100.0));
-            } else {
-                line.push_str(&format!("{size:>9} "));
+            line.push_str(&format!("{:>9} ", human_size(tree.total(id))));
+            if counts {
+                let count = |n: u32| if is_dir { ff_core::sizes::short_count(n) } else { String::new() };
+                line.push_str(&format!("{}{:>6} {:>6}{base} ", self.paint.dim, count(tree.files(id)), count(tree.folders(id))));
+            }
+            if parent {
+                let of = self.index.parent(id).map_or(tree.total(id), |p| tree.total(p));
+                let share = if of == 0 { 0.0 } else { tree.total(id) as f64 / of as f64 };
+                line.push(' ');
+                line.push_str(&self.share(Some(share), self.paint.bar, base));
+            }
+            if disk {
+                let share = self.disk_share(tree, id);
+                let colour = if share.is_some_and(|s| s >= 0.9) { self.paint.full } else { self.paint.bar };
+                line.push_str("  ");
+                line.push_str(&self.share(share, colour, base));
+            }
+            if free {
+                // Shown on a whole drive only: inside it, it is the same.
+                let left = self.disk_of(id).filter(|_| self.is_drive(id)).map_or(String::new(), |(_, f)| human_size(f));
+                line.push_str(&format!("{left:>10}"));
             }
             lines.push(line);
         }
+    }
+
+    /// A share as an 8-cell bar on its track, then its figure: 15 cells.
+    fn share(&self, share: Option<f64>, colour: &str, base: &str) -> String {
+        let Some(share) = share else { return " ".repeat(15) };
+        let filled = bar(share, 8);
+        // Without colours the track is left blank; with them it is the same
+        // glyph in grey, so the bar reads as a gauge.
+        let track = if self.paint.track.is_empty() { " " } else { "▆" };
+        // Reverse video (the selected row) would swap glyph and cell, and
+        // draw the gap instead of the bar: the bar itself is never reversed.
+        let unreverse = if self.paint.track.is_empty() { "" } else { "\x1b[27m" };
+        format!(
+            "{unreverse}{colour}{}{}{}{base} {:>5.1}%",
+            "▆".repeat(filled),
+            self.paint.track,
+            track.repeat(8 - filled),
+            share * 100.0
+        )
+    }
+
+    /// The capacity and free space of the drive `id` is on, if known.
+    fn disk_of(&self, mut id: u32) -> Option<(u64, u64)> {
+        while let Some(p) = self.index.parent(id) {
+            id = p;
+        }
+        self.disks.iter().find(|d| d.0 == id).map(|d| d.1)
+    }
+
+    /// True for a whole drive: a root such as C:\ or /.
+    fn is_drive(&self, id: u32) -> bool {
+        self.index.parent(id).is_none() && self.index.path(id).parent().is_none()
+    }
+
+    /// An entry's share of its drive; for a whole drive, how full it is.
+    fn disk_share(&self, tree: &Tree, id: u32) -> Option<f64> {
+        let (capacity, free) = self.disk_of(id)?;
+        let used = if self.is_drive(id) { capacity.saturating_sub(free) } else { tree.total(id) };
+        Some((used as f64 / capacity as f64).min(1.0))
     }
 
     fn panel_lines(&self, title: &str, items: &[(String, String)], body: usize, cols: usize, lines: &mut Vec<String>) {
@@ -1312,7 +1639,20 @@ impl Ui {
             match tree.selected() {
                 Some(id) => {
                     let files = if self.index.is_dir(id) { format!("  ·  {} files", group_digits(tree.files(id) as u64)) } else { String::new() };
-                    format!(" {} ({} bytes){files}  ·  Esc back", human_size(tree.total(id)), group_digits(tree.total(id)))
+                    // A whole drive: how full it is; anything else: its
+                    // share of the drive.
+                    let disk = match (self.disk_of(id), self.disk_share(tree, id)) {
+                        (Some((capacity, free)), Some(share)) if self.is_drive(id) => format!(
+                            "  ·  disk {:.1} % used: {} of {}, {} free",
+                            share * 100.0,
+                            human_size(capacity.saturating_sub(free)),
+                            human_size(capacity),
+                            human_size(free)
+                        ),
+                        (_, Some(share)) => format!("  ·  {:.1} % of the disk", share * 100.0),
+                        _ => String::new(),
+                    };
+                    format!(" {} ({} bytes){files}{disk}  ·  Esc back", human_size(tree.total(id)), group_digits(tree.total(id)))
                 }
                 None => " The index is empty".into(),
             }
@@ -1385,6 +1725,7 @@ fn line_text(s: &str) -> String {
 /// The editor on these files; `read_only` adds the flag that makes the
 /// common terminal editors refuse to save. (Any other editor cannot save
 /// either: the user has no permission to.)
+#[cfg(unix)]
 fn editor_command(editor: &str, paths: &[PathBuf], read_only: bool) -> Command {
     let program = editor.split_whitespace().next().unwrap_or("");
     let flag = match program.rsplit('/').next().unwrap_or(program) {
@@ -1399,8 +1740,78 @@ fn editor_command(editor: &str, paths: &[PathBuf], read_only: bool) -> Command {
     command
 }
 
+/// On Windows the editor setting is split on spaces (`code -w`), with a
+/// quoted program path kept whole (`"C:\Program Files\x\x.exe" -n`).
+#[cfg(windows)]
+fn editor_command(editor: &str, paths: &[PathBuf], read_only: bool) -> Command {
+    let editor = editor.trim();
+    let (program, rest) = match editor.strip_prefix('"').and_then(|e| e.split_once('"')) {
+        Some((program, rest)) => (program, rest),
+        None => editor.split_once(' ').unwrap_or((editor, "")),
+    };
+    let name = program.rsplit(['\\', '/']).next().unwrap_or(program).trim_end_matches(".exe").to_ascii_lowercase();
+    let mut command = Command::new(program);
+    command.args(rest.split_whitespace());
+    if read_only {
+        match name.as_str() {
+            "vi" | "vim" | "nvim" | "view" | "gvim" => {
+                command.arg("-R");
+            }
+            "nano" => {
+                command.arg("-v");
+            }
+            _ => {}
+        }
+    }
+    command.args(paths);
+    command
+}
+
+/// The editor when neither `$VISUAL` nor `$EDITOR` is set.
+#[cfg(unix)]
+const DEFAULT_EDITOR: &str = "vi";
+#[cfg(windows)]
+const DEFAULT_EDITOR: &str = "notepad";
+
+/// Runs a program that has the terminal, waiting for it. Ctrl+C at a
+/// password prompt, or in the editor, is meant for it: like system(3),
+/// we ignore it while it runs, and it gets the usual handling.
+#[cfg(unix)]
+fn run_ignoring_ctrl_c(mut command: Command) -> io::Result<std::process::ExitStatus> {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: signal() is async-signal-safe, as pre_exec requires.
+    unsafe {
+        command.pre_exec(|| {
+            sys::signal(sys::SIGINT, sys::SIG_DFL);
+            sys::signal(sys::SIGQUIT, sys::SIG_DFL);
+            Ok(())
+        });
+    }
+    // SAFETY: setting and restoring dispositions; no handler code runs.
+    let saved = unsafe { (sys::signal(sys::SIGINT, sys::SIG_IGN), sys::signal(sys::SIGQUIT, sys::SIG_IGN)) };
+    let status = command.status();
+    unsafe {
+        sys::signal(sys::SIGINT, saved.0);
+        sys::signal(sys::SIGQUIT, saved.1);
+    }
+    status
+}
+
+/// On Windows, Ctrl+C reaches every program on the console; a handler
+/// that swallows it keeps us alive (handlers are not inherited, so the
+/// editor still gets its own).
+#[cfg(windows)]
+fn run_ignoring_ctrl_c(mut command: Command) -> io::Result<std::process::ExitStatus> {
+    // SAFETY: adding and removing a handler that only returns a value.
+    unsafe { sys::SetConsoleCtrlHandler(Some(sys::ignore_ctrl_c), 1) };
+    let status = command.status();
+    unsafe { sys::SetConsoleCtrlHandler(Some(sys::ignore_ctrl_c), 0) };
+    status
+}
+
 /// True if we may use the file in a way (`mode`: 4 read, 2 write), as
 /// `access(2)` says, which knows about groups and read-only filesystems.
+#[cfg(unix)]
 fn may(path: &Path, mode: i32) -> bool {
     use std::os::unix::ffi::OsStrExt;
     unsafe extern "C" {
@@ -1411,9 +1822,23 @@ fn may(path: &Path, mode: i32) -> bool {
     unsafe { access(path.as_ptr(), mode) == 0 }
 }
 
+/// Only asked on the way to sudoedit, which Windows does not have.
+#[cfg(windows)]
+fn may(_: &Path, _: i32) -> bool {
+    true
+}
+
 /// True when a graphical desktop is there to open files on.
+#[cfg(not(windows))]
 fn desktop() -> bool {
     ["WAYLAND_DISPLAY", "DISPLAY"].iter().any(|v| std::env::var_os(v).is_some_and(|d| !d.is_empty()))
+}
+
+/// A Windows session always has one (over SSH there is no window station
+/// to show it on, but opening then fails with a message).
+#[cfg(windows)]
+fn desktop() -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -1458,7 +1883,8 @@ mod tests {
     fn helpers() {
         assert_eq!(base64(b"/tmp/a b"), "L3RtcC9hIGI=");
         assert_eq!(base64(b"ab"), "YWI=");
-        assert_eq!(bar(0.5, 4), "██  ");
-        assert_eq!(bar(1.0, 2), "██");
+        assert_eq!(bar(0.5, 4), 2);
+        assert_eq!(bar(1.0, 2), 2);
+        assert_eq!(bar(1.5, 8), 8);
     }
 }

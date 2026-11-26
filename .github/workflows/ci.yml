@@ -41,6 +41,64 @@ jobs:
             target/x86_64-unknown-linux-musl/release/ff-gui
           retention-days: 3
 
+  windows:
+    name: Windows build and tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+      - run: cargo test --target x86_64-pc-windows-msvc
+      - run: cargo win
+      - name: Run what was built
+        shell: bash
+        run: |
+          set -eux
+          bin=target/x86_64-pc-windows-msvc/release
+          $bin/ff.exe --version
+          $bin/ffd.exe --help
+          export FF_DB=$RUNNER_TEMP/ff.db
+          $bin/ff.exe index "$GITHUB_WORKSPACE"
+          $bin/ff.exe -n 1 Cargo.toml | grep -F 'Cargo.toml'
+          $bin/ff.exe -n 1 crates/ff-core/src/lib.rs | grep -F 'crates\ff-core\src\lib.rs'
+      - name: Build the installer
+        shell: pwsh
+        run: packaging/windows/build-installer.ps1
+      - name: Install, run and uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = "$env:RUNNER_TEMP\Fast search"
+          $p = Start-Process dist\fast-search-windows-x86_64-setup.exe -Wait -PassThru `
+            -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/CURRENTUSER', "/DIR=`"$dir`"", '/TASKS=path'
+          if ($p.ExitCode -ne 0) { throw "setup failed: $($p.ExitCode)" }
+          & "$dir\ff.exe" --version
+          $path = (Get-Item 'HKCU:\Environment').GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+          if (($path -split ';') -notcontains $dir) { throw "the folder was not added to PATH: $path" }
+          if (-not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Fast search.lnk")) { throw "no Start menu shortcut" }
+          $p = Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "uninstall failed: $($p.ExitCode)" }
+          Start-Sleep 2
+          $path = (Get-Item 'HKCU:\Environment').GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+          if (($path -split ';') -contains $dir) { throw "the folder was left in PATH" }
+          if (Test-Path "$dir\ff.exe") { throw "files were left behind" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-binaries
+          path: |
+            target/x86_64-pc-windows-msvc/release/ff.exe
+            target/x86_64-pc-windows-msvc/release/ff-gui.exe
+            target/x86_64-pc-windows-msvc/release/ffd.exe
+            dist/fast-search-windows-x86_64-setup.exe
+          retention-days: 3
+
   draw:
     name: Draws on ${{ matrix.name }}
     needs: build

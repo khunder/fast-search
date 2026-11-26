@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
 
-use crate::backend::{Backend, Cursor, Event, Mods, Win, WindowSpec};
+use crate::backend::{Backend, Cursor, Event, FIRST, Mods, Win, WindowSpec};
 use crate::canvas::{Canvas, Icon};
 use crate::debug;
 use crate::x11::P::*;
@@ -190,7 +190,17 @@ pub fn hold_clipboard(file: bool) -> io::Result<()> {
 
 pub struct X11 {
     c: Conn,
+    /// The first search window: it owns the clipboard and offers drags.
     win: u32,
+    /// Every search window by number (the first is `win`); 0 where one
+    /// was closed.
+    wins: Vec<u32>,
+    /// The one `select` chose.
+    selected: usize,
+    /// The window title, and whether we draw title bars ourselves, for
+    /// windows opened later.
+    title: String,
+    own_title: bool,
     /// The pointer shape shown, the standard cursor font (0 until it
     /// is needed) and the cursors made from it so far.
     cursor: Cursor,
@@ -199,22 +209,27 @@ pub struct X11 {
     gc: u32,
     /// The dialog window, or 0.
     dialog: u32,
-    /// What each window currently shows (empty: must resend everything).
-    shown: [Vec<u8>; 2],
+    /// What each search window currently shows, by number, and the
+    /// dialog (empty: must resend everything).
+    shown: Vec<Vec<u8>>,
+    dialog_shown: Vec<u8>,
     scale: f32,
     /// Events produced but not yet handed out.
     pending: VecDeque<Event>,
-    size: (usize, usize),
+    /// Each search window's size, by number.
+    sizes: Vec<(usize, usize)>,
 
     wm_delete: u32,
     wm_protocols: u32,
     net_wm_name: u32,
+    net_wm_icon: u32,
     paste_prop: u32,
     motif_hints: u32,
     net_wm_moveresize: u32,
     net_wm_state: u32,
     net_wm_maximized: [u32; 2],
     wm_change_state: u32,
+    net_active_window: u32,
     clip: ClipAtoms,
     dnd: DndAtoms,
 
@@ -226,6 +241,39 @@ pub struct X11 {
     drag: Option<Drag>,
     /// Paths (one per line) offered to whatever a drag is dropped on.
     dropped: String,
+}
+
+/// The atoms a search window's properties need.
+#[derive(Clone, Copy)]
+struct WindowAtoms {
+    wm_protocols: u32,
+    wm_delete: u32,
+    net_wm_name: u32,
+    net_wm_icon: u32,
+    utf8_string: u32,
+}
+
+/// Creates a search window (not mapped yet) with its title, class, close
+/// protocol and icon.
+fn make_window(c: &mut Conn, atoms: &WindowAtoms, title: &str, w: i32, h: i32) -> u32 {
+    let win = c.new_id();
+    // Events: KeyPress | ButtonPress | ButtonRelease | PointerMotion |
+    // Exposure | StructureNotify.
+    let events = 0x1 | 0x4 | 0x8 | 0x40 | 0x8000 | 0x20000;
+    c.req(1, 0, &[W(win), W(c.root), H(0), H(0), H(w as u16), H(h as u16), H(0), H(1), W(0), W(0x800), W(events)]);
+    c.set_property(win, atoms.wm_protocols, ATOM_ATOM, 32, &atoms.wm_delete.to_le_bytes());
+    c.set_property(win, ATOM_WM_NAME, ATOM_STRING, 8, title.as_bytes());
+    c.set_property(win, atoms.net_wm_name, atoms.utf8_string, 8, title.as_bytes());
+    c.set_property(win, ATOM_WM_CLASS, ATOM_STRING, 8, b"ff-gui\0ff-gui\0");
+    // _NET_WM_ICON: width, height, then ARGB pixels, for each size.
+    let mut icon = Vec::new();
+    for size in [48usize, 128] {
+        icon.extend((size as u32).to_le_bytes());
+        icon.extend((size as u32).to_le_bytes());
+        icon.extend(Icon::App.render(size).into_iter().flatten());
+    }
+    c.set_property(win, atoms.net_wm_icon, 6, 32, &icon); // type CARDINAL
+    win
 }
 
 /// Desktop scale from the Xft.dpi resource (96 dpi = 1.0).
@@ -248,50 +296,36 @@ impl X11 {
         let scale = spec.scale.unwrap_or_else(|| desktop_scale(&mut c));
         let u = (scale.round() as i32).max(1);
         let (w, h) = (spec.width * u, spec.height * u);
-        let win = c.new_id();
-        // Events: KeyPress | ButtonPress | ButtonRelease | PointerMotion |
-        // Exposure | StructureNotify.
-        let events = 0x1 | 0x4 | 0x8 | 0x40 | 0x8000 | 0x20000;
-        c.req(
-            1,
-            0,
-            &[W(win), W(c.root), H(0), H(0), H(w as u16), H(h as u16), H(0), H(1), W(0), W(0x800), W(events)],
-        );
-        let gc = c.new_id();
-        c.req(55, 0, &[W(gc), W(win), W(0x10000), W(0)]); // no graphics exposures
-
         let wm_protocols = c.intern_atom("WM_PROTOCOLS")?;
         let wm_delete = c.intern_atom("WM_DELETE_WINDOW")?;
         let net_wm_name = c.intern_atom("_NET_WM_NAME")?;
-        let clip = ClipAtoms::intern(&mut c)?;
-        c.set_property(win, wm_protocols, ATOM_ATOM, 32, &wm_delete.to_le_bytes());
-        c.set_property(win, ATOM_WM_NAME, ATOM_STRING, 8, spec.title.as_bytes());
-        c.set_property(win, net_wm_name, clip.utf8_string, 8, spec.title.as_bytes());
-        c.set_property(win, ATOM_WM_CLASS, ATOM_STRING, 8, b"ff-gui\0ff-gui\0");
-        // _NET_WM_ICON: width, height, then ARGB pixels, for each size.
         let net_wm_icon = c.intern_atom("_NET_WM_ICON")?;
-        let mut icon = Vec::new();
-        for size in [48usize, 128] {
-            icon.extend((size as u32).to_le_bytes());
-            icon.extend((size as u32).to_le_bytes());
-            icon.extend(Icon::App.render(size).into_iter().flatten());
-        }
-        c.set_property(win, net_wm_icon, 6, 32, &icon); // type CARDINAL
+        let clip = ClipAtoms::intern(&mut c)?;
+        let atoms = WindowAtoms { wm_protocols, wm_delete, net_wm_name, net_wm_icon, utf8_string: clip.utf8_string };
+        let win = make_window(&mut c, &atoms, spec.title, w, h);
+        let gc = c.new_id();
+        c.req(55, 0, &[W(gc), W(win), W(0x10000), W(0)]); // no graphics exposures
 
         let mut x = X11 {
             win,
+            wins: vec![win],
+            selected: 0,
+            title: spec.title.to_string(),
+            own_title: false,
             cursor: Cursor::Arrow,
             cursor_font: 0,
             cursors: Vec::new(),
             gc,
             dialog: 0,
-            shown: [Vec::new(), Vec::new()],
+            shown: vec![Vec::new()],
+            dialog_shown: Vec::new(),
             scale,
-            pending: VecDeque::from([Event::Resize(w as usize, h as usize)]),
-            size: (w as usize, h as usize),
+            pending: VecDeque::from([Event::Resize(FIRST, w as usize, h as usize)]),
+            sizes: vec![(w as usize, h as usize)],
             wm_delete,
             wm_protocols,
             net_wm_name,
+            net_wm_icon,
             paste_prop: c.intern_atom("FF_PASTE")?,
             motif_hints: c.intern_atom("_MOTIF_WM_HINTS")?,
             net_wm_moveresize: c.intern_atom("_NET_WM_MOVERESIZE")?,
@@ -301,6 +335,7 @@ impl X11 {
                 c.intern_atom("_NET_WM_STATE_MAXIMIZED_HORZ")?,
             ],
             wm_change_state: c.intern_atom("WM_CHANGE_STATE")?,
+            net_active_window: c.intern_atom("_NET_ACTIVE_WINDOW")?,
             clip,
             dnd: DndAtoms::intern(&mut c)?,
             copied: String::new(),
@@ -311,26 +346,53 @@ impl X11 {
             dropped: String::new(),
             c,
         };
-        x.c.req(8, 0, &[W(win)]); // MapWindow
+        // Started at sign-in: not shown until asked for.
+        if !spec.hidden {
+            x.c.req(8, 0, &[W(win)]); // MapWindow
+        }
         Ok(x)
     }
 
     fn win_of(&self, window: u32) -> Option<Win> {
-        if window == self.win {
-            Some(Win::Main)
-        } else if window == self.dialog && window != 0 {
+        if window == 0 {
+            None
+        } else if window == self.dialog {
             Some(Win::Dialog)
         } else {
-            None
+            self.wins.iter().position(|&w| w == window).map(|n| Win::Main(n as u8))
         }
     }
 
-    /// Sends a request to the window manager (a ClientMessage to the root).
+    /// The selected search window (the first if it was closed).
+    fn cur(&self) -> u32 {
+        self.wins.get(self.selected).copied().filter(|&w| w != 0).unwrap_or(self.win)
+    }
+
+    fn atoms(&self) -> WindowAtoms {
+        WindowAtoms {
+            wm_protocols: self.wm_protocols,
+            wm_delete: self.wm_delete,
+            net_wm_name: self.net_wm_name,
+            net_wm_icon: self.net_wm_icon,
+            utf8_string: self.clip.utf8_string,
+        }
+    }
+
+    /// Asks the window manager to draw a title bar for `window` or not.
+    fn decorate(&mut self, window: u32) {
+        // _MOTIF_WM_HINTS: flags = decorations field is set; decorations 0/1.
+        let hints = words(&[2, 0, if self.own_title { 0 } else { 1 }, 0, 0]);
+        self.c.set_property(window, self.motif_hints, self.motif_hints, 32, &hints);
+    }
+
+    /// Sends a request about the selected window to the window manager
+    /// (a ClientMessage to the root).
     fn wm_message(&mut self, kind: u32, data: [u32; 5]) {
         let [a, b, c, d, e] = data;
+        let window = self.cur();
         // SendEvent with SubstructureRedirect | SubstructureNotify.
         let event =
-            [W(self.c.root), W(0x18_0000), B(EV_CLIENT_MESSAGE), B(32), H(0), W(self.win), W(kind), W(a), W(b), W(c), W(d), W(e)];
+            [W(self.c.root), W(0x18_0000), B(EV_CLIENT_MESSAGE), B(32), H(0), W(window), W(kind), W(a), W(b), W(c), W(d), W(e)];
         self.c.req(25, 0, &event);
     }
 
@@ -359,15 +421,19 @@ impl X11 {
         };
         match code {
             EV_EXPOSE => {
-                self.shown[win as usize].clear();
+                self.shown_of(win).clear();
                 self.pending.push_back(Event::Redraw(win));
             }
-            EV_CONFIGURE if win == Win::Main => {
+            EV_CONFIGURE if win != Win::Dialog => {
+                let Win::Main(n) = win else { return Ok(()) };
                 let size = (u16at(ev, 20) as usize, u16at(ev, 22) as usize);
-                if size != self.size {
-                    self.size = size;
-                    self.shown[0].clear();
-                    self.pending.push_back(Event::Resize(size.0.max(1), size.1.max(1)));
+                if self.sizes.len() <= n as usize {
+                    self.sizes.resize(n as usize + 1, (0, 0));
+                }
+                if size != self.sizes[n as usize] {
+                    self.sizes[n as usize] = size;
+                    self.shown_of(win).clear();
+                    self.pending.push_back(Event::Resize(win, size.0.max(1), size.1.max(1)));
                 }
             }
             EV_KEY_PRESS => {
@@ -414,6 +480,19 @@ impl X11 {
         Ok(())
     }
 
+    /// What `win` shows now (to send only what changed).
+    fn shown_of(&mut self, win: Win) -> &mut Vec<u8> {
+        match win {
+            Win::Main(n) => {
+                if self.shown.len() <= n as usize {
+                    self.shown.resize(n as usize + 1, Vec::new());
+                }
+                &mut self.shown[n as usize]
+            }
+            Win::Dialog => &mut self.dialog_shown,
+        }
+    }
+
     // ---- dragging out (XDND source) -------------------------------------
 
     /// Answers a request for data we offer: the clipboard, or the files
@@ -444,7 +523,7 @@ impl X11 {
     /// If `window` accepts drops, a target for it.
     fn drop_target(&mut self, window: u32) -> io::Result<Option<DropTarget>> {
         let aware = self.c.get_property(window, self.dnd.aware, false)?;
-        if aware.len() < 4 || window == self.win {
+        if aware.len() < 4 || self.wins.contains(&window) {
             return Ok(None);
         }
         let proxy = self.c.get_property(window, self.dnd.proxy, false)?;
@@ -459,7 +538,7 @@ impl X11 {
     fn drop_proxies(&mut self) -> io::Result<Vec<u32>> {
         let mut proxies = Vec::new();
         for window in self.c.children(self.c.root)? {
-            if window == self.win || self.c.get_property(window, self.dnd.aware, false)?.len() < 4 {
+            if self.wins.contains(&window) || self.c.get_property(window, self.dnd.aware, false)?.len() < 4 {
                 continue;
             }
             let kind = self.c.window_kind(window)?;
@@ -623,11 +702,16 @@ impl Backend for X11 {
 
     /// Sends the rows that changed since the last frame to the window.
     fn present(&mut self, win: Win, cv: &Canvas) -> io::Result<()> {
-        let window = if win == Win::Main { self.win } else { self.dialog };
+        let window = match win {
+            Win::Main(n) => self.wins.get(n as usize).copied().unwrap_or(0),
+            Win::Dialog => self.dialog,
+        };
         if window == 0 {
             return Ok(());
         }
-        let shown = &mut self.shown[win as usize];
+        let gc = self.gc;
+        let shown = std::mem::take(self.shown_of(win));
+        let mut shown = shown;
         let stride = cv.w * 4;
         let same_size = shown.len() == cv.px.len();
         let mut row = 0;
@@ -641,9 +725,10 @@ impl Backend for X11 {
             while row < cv.h && changed(row) {
                 row += 1;
             }
-            self.c.put_image(window, self.gc, cv.w, start, &cv.px[start * stride..row * stride])?;
+            self.c.put_image(window, gc, cv.w, start, &cv.px[start * stride..row * stride])?;
         }
         shown.clone_from(&cv.px);
+        *self.shown_of(win) = shown;
         self.c.flush()
     }
 
@@ -652,11 +737,57 @@ impl Backend for X11 {
     }
 
     fn set_own_title_bar(&mut self, own: bool) -> bool {
-        // _MOTIF_WM_HINTS: flags = decorations field is set; decorations 0/1.
-        let hints = words(&[2, 0, if own { 0 } else { 1 }, 0, 0]);
-        self.c.set_property(self.win, self.motif_hints, self.motif_hints, 32, &hints);
-        self.shown[0].clear();
+        self.own_title = own;
+        for window in self.wins.clone().into_iter().filter(|&w| w != 0) {
+            self.decorate(window);
+        }
+        for shown in &mut self.shown {
+            shown.clear();
+        }
         own
+    }
+
+    fn open_window(&mut self) -> io::Result<u8> {
+        let n = self.wins.iter().skip(1).position(|&w| w == 0).map_or(self.wins.len(), |i| i + 1);
+        if n > u8::MAX as usize {
+            return Err(io::Error::other("too many windows"));
+        }
+        let (w, h) = self.sizes.first().copied().unwrap_or((800, 600));
+        let atoms = self.atoms();
+        let title = self.title.clone();
+        let window = make_window(&mut self.c, &atoms, &title, w as i32, h as i32);
+        self.decorate(window);
+        if self.wins.len() <= n {
+            self.wins.resize(n + 1, 0);
+        }
+        self.wins[n] = window;
+        if self.sizes.len() <= n {
+            self.sizes.resize(n + 1, (0, 0));
+        }
+        self.sizes[n] = (w, h);
+        self.shown_of(Win::Main(n as u8)).clear();
+        self.c.req(8, 0, &[W(window)]); // MapWindow
+        let previous = std::mem::replace(&mut self.selected, n);
+        self.wm_message(self.net_active_window, [2, 0, 0, 0, 0]);
+        self.selected = previous;
+        self.c.flush()?;
+        self.pending.push_back(Event::Resize(Win::Main(n as u8), w.max(1), h.max(1)));
+        Ok(n as u8)
+    }
+
+    fn close_window(&mut self, n: u8) {
+        let n = n as usize;
+        if n == 0 || n >= self.wins.len() || self.wins[n] == 0 {
+            return;
+        }
+        let window = std::mem::replace(&mut self.wins[n], 0);
+        self.shown_of(Win::Main(n as u8)).clear();
+        self.c.req(4, 0, &[W(window)]); // DestroyWindow
+        let _ = self.c.flush();
+    }
+
+    fn select(&mut self, n: u8) {
+        self.selected = n as usize;
     }
 
     fn start_move(&mut self) {
@@ -690,7 +821,8 @@ impl Backend for X11 {
                 id
             }
         };
-        self.c.req(2, 0, &[W(self.win), W(0x4000), W(id)]); // ChangeWindowAttributes: cursor
+        let window = self.cur();
+        self.c.req(2, 0, &[W(window), W(0x4000), W(id)]); // ChangeWindowAttributes: cursor
         let _ = self.c.flush();
     }
 
@@ -698,6 +830,24 @@ impl Backend for X11 {
         self.c.req(27, 0, &[W(0)]); // UngrabPointer, so the WM can grab it
         let (x, y) = self.pointer_root;
         self.wm_message(self.net_wm_moveresize, [x as u32, y as u32, edge, 1, 1]);
+    }
+
+    fn hide_to_tray(&mut self) -> bool {
+        self.close_dialog();
+        self.c.req(10, 0, &[W(self.win)]); // UnmapWindow
+        let _ = self.c.flush();
+        true
+    }
+
+    fn show(&mut self) {
+        self.c.req(8, 0, &[W(self.win)]); // MapWindow
+        // Ask the window manager to bring it forward and give it the
+        // keyboard: source 2 is a pager, which managers obey.
+        let previous = std::mem::replace(&mut self.selected, 0);
+        self.wm_message(self.net_active_window, [2, 0, 0, 0, 0]);
+        self.selected = previous;
+        let _ = self.c.flush();
+        self.pending.push_back(Event::Redraw(FIRST));
     }
 
     fn minimize(&mut self) {
@@ -745,6 +895,7 @@ impl Backend for X11 {
 
     fn open_dialog(&mut self, w: i32, h: i32, title: &str) -> io::Result<()> {
         self.close_dialog();
+        let owner = self.cur();
         let win = self.c.new_id();
         // Events: KeyPress | ButtonPress | PointerMotion | Exposure.
         let events = 0x1 | 0x4 | 0x40 | 0x8000;
@@ -757,7 +908,7 @@ impl Backend for X11 {
         c.set_property(win, self.net_wm_name, self.clip.utf8_string, 8, title.as_bytes());
         c.set_property(win, ATOM_WM_CLASS, ATOM_STRING, 8, b"ff-gui\0ff-gui\0");
         c.set_property(win, self.wm_protocols, ATOM_ATOM, 32, &words(&[self.wm_delete]));
-        c.set_property(win, 68, 33, 32, &words(&[self.win])); // WM_TRANSIENT_FOR: belongs to the main window
+        c.set_property(win, 68, 33, 32, &words(&[owner])); // WM_TRANSIENT_FOR: belongs to the search window
         c.set_property(win, window_type, ATOM_ATOM, 32, &words(&[type_dialog]));
         c.set_property(win, self.net_wm_state, ATOM_ATOM, 32, &words(&[state_modal]));
         // WM_NORMAL_HINTS: minimum size = maximum size, so it cannot be resized.
@@ -767,7 +918,7 @@ impl Backend for X11 {
         c.set_property(win, 40, 41, 32, &words(&hints));
         c.req(8, 0, &[W(win)]); // MapWindow
         self.dialog = win;
-        self.shown[1].clear();
+        self.dialog_shown.clear();
         Ok(())
     }
 
@@ -775,7 +926,7 @@ impl Backend for X11 {
         if self.dialog != 0 {
             self.c.req(4, 0, &[W(self.dialog)]); // DestroyWindow
             self.dialog = 0;
-            self.shown[1].clear();
+            self.dialog_shown.clear();
         }
     }
 

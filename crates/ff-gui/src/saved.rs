@@ -172,7 +172,7 @@ impl App {
         }
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
         let (y, mo, d, h, mi) = ff_core::local_civil(now);
-        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let home = ff_core::os::home_dir().unwrap_or_default();
         let folder = Some(home.join("Downloads")).filter(|d| d.is_dir()).unwrap_or(home);
         let path = folder.join(format!("fast-search-{y:04}-{mo:02}-{d:02}-{h:02}{mi:02}.csv"));
         let rows = vec![Row::Text(trf("Save {} rows as a CSV file (for a spreadsheet):", &[&group_digits(n as u64)])), Row::Input("/path/to/file.csv", Action::ConfirmExport)];
@@ -185,8 +185,8 @@ impl App {
         let typed = std::mem::take(&mut self.dialog_input);
         self.close_dialog();
         let typed = typed.trim();
-        let path = match typed.strip_prefix("~/") {
-            Some(rest) => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(rest),
+        let path = match typed.strip_prefix("~/").or_else(|| typed.strip_prefix("~\\")) {
+            Some(rest) => ff_core::os::home_dir().unwrap_or_default().join(rest),
             None => PathBuf::from(typed),
         };
         if !path.is_absolute() {

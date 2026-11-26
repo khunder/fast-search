@@ -394,8 +394,9 @@ impl App {
                 Row::Button(label, action) => {
                     let Some(index) = item_at(Item::RowButton(*action)) else { continue };
                     let (x, by, bw, bh, _) = layout.items[index];
-                    d.cv.fill(x, by, bw, bh, if d.hover == Some(index) { 0xdcdcdc } else { 0xececec });
-                    d.cv.frame(x, by, bw, bh, line, if d.focus == index { 0x5b9bea } else { 0xa8a8a8 });
+                    let fill = if d.hover == Some(index) { HOVER } else { WHITE };
+                    let edge = if d.focus == index { SELECT } else { LINE };
+                    d.cv.round_frame(x, by, bw, bh, 4 * u, line, edge, fill);
                     self.text.draw(&mut d.cv, x + 14 * u, by + (bh - self.text.height) / 2, label, bw, TEXT);
                 }
                 Row::ListItem(label, action) => {
@@ -455,15 +456,15 @@ impl App {
             let main = i == last && d.buttons[i].1.is_some();
             let (fill, ink) = match (main, d.danger, d.hover == Some(index)) {
                 (true, true, hovered) => (if hovered { 0xb3261e } else { 0xd93025 }, ON_ACCENT),
-                (true, false, hovered) => (if hovered { 0x1557ad } else { SELECT }, ON_ACCENT),
-                (false, _, true) => (0xdcdcdc, TEXT),
-                (false, _, false) => (0xececec, TEXT),
+                (true, false, _) => (SELECT, ON_ACCENT),
+                (false, _, true) => (HOVER, TEXT),
+                (false, _, false) => (WHITE, TEXT),
             };
-            d.cv.fill(x, by, bw, bh, fill);
-            d.cv.frame(x, by, bw, bh, line, if main { fill } else { 0xa8a8a8 });
+            // Windows 11 buttons: rounded; the focus ring follows the shape.
             if d.focus == index {
-                d.cv.frame(x - 3 * u, by - 3 * u, bw + 6 * u, bh + 6 * u, line, 0x5b9bea); // focus ring
+                d.cv.round_frame(x - 3 * u, by - 3 * u, bw + 6 * u, bh + 6 * u, 7 * u, 2 * line, TEXT, palette::BASE);
             }
+            d.cv.round_frame(x, by, bw, bh, 4 * u, line, if main { fill } else { LINE }, fill);
             let lx = x + (bw - self.text.width(label)) / 2;
             self.text.draw(&mut d.cv, lx, by + (bh - self.text.height) / 2, label, bw, ink);
         }
@@ -603,7 +604,16 @@ impl App {
                 let set_focus = |app: &mut App, f: usize| app.dialog.as_mut().unwrap().focus = f;
                 // With the text field focused, keys type into it.
                 let typing = matches!(items.get(focus), Some((.., Item::Input(_))));
+                let shortcut_field = matches!(items.get(focus), Some((.., Item::Input(Action::SetShortcut))));
                 match key {
+                    // The shortcut field takes the keys pressed, such as
+                    // Alt+Q, and sets them at once.
+                    _ if shortcut_field && (mods.ctrl || mods.alt) && pressed_keys(key, mods).is_some() => {
+                        self.dialog_input = pressed_keys(key, mods).unwrap_or_default();
+                        self.act(Action::SetShortcut, 0);
+                        self.render_dialog()?;
+                        return Ok(());
+                    }
                     Key::Char(ch) if typing && mods.ctrl => {
                         if ch.eq_ignore_ascii_case(&'v') {
                             self.b.request_paste(); // the text arrives as an event
@@ -627,4 +637,19 @@ impl App {
         }
         self.render_dialog()
     }
+}
+
+/// A key pressed with its modifiers, as people write it ("Ctrl+Alt+F",
+/// "Alt+Q", "Ctrl+F12"), for the shortcut field; None for a key a
+/// shortcut cannot use.
+fn pressed_keys(key: Key, mods: Mods) -> Option<String> {
+    let name = match key {
+        Key::Char(' ') => "Space".to_string(),
+        Key::Char(c) if c.is_ascii_alphanumeric() => c.to_ascii_uppercase().to_string(),
+        // F1 to F12 follow each other as key syms.
+        Key::Sym(sym) if (K_F1..K_F1 + 12).contains(&sym) => format!("F{}", sym - K_F1 + 1),
+        _ => return None,
+    };
+    let held = [(mods.ctrl, "Ctrl+"), (mods.alt, "Alt+"), (mods.shift, "Shift+")];
+    Some(held.iter().filter(|(on, _)| *on).map(|(_, m)| *m).collect::<String>() + &name)
 }

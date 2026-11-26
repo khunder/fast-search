@@ -17,8 +17,8 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-#[cfg(not(all(unix, target_pointer_width = "64")))]
-compile_error!("ff-core supports 64-bit Unix targets only");
+#[cfg(not(all(any(unix, windows), target_pointer_width = "64")))]
+compile_error!("ff-core supports 64-bit Unix and Windows targets only");
 
 pub mod bookmarks;
 pub mod complete;
@@ -26,13 +26,18 @@ pub mod desktop;
 pub mod ffi;
 mod index;
 pub mod live;
+pub mod os;
 mod query;
 pub mod rawfs;
 pub mod sizes;
 pub mod time;
+pub mod update;
+pub mod watch;
 mod walk;
+#[cfg(windows)]
+pub mod win;
 
-pub use index::{FLAG_DIR, FLAG_SYMLINK, Index, NO_PARENT};
+pub use index::{FLAG_DIR, FLAG_GONE, FLAG_SYMLINK, Index, NO_PARENT};
 pub use query::{CaseMode, Kind, Query, QueryOptions, SearchOptions, Sort};
 pub use time::{local_civil, utc_civil};
 pub use walk::BuildOptions;
@@ -40,23 +45,23 @@ pub use walk::BuildOptions;
 use std::path::PathBuf;
 
 /// Where the `ffd` daemon publishes its always-current index.
+#[cfg(not(windows))]
 pub const SYSTEM_DB: &str = "/run/ff/index.db";
+/// Where the `ffd` service publishes its always-current index.
+#[cfg(windows)]
+pub const SYSTEM_DB: &str = r"C:\ProgramData\ff\index.db";
 
 /// Default index location: `$FF_DB`; else the daemon's index if we may
-/// read it; else `$XDG_CACHE_HOME/ff/index.db` or `~/.cache/ff/index.db`.
+/// read it; else `$XDG_CACHE_HOME/ff/index.db` or `~/.cache/ff/index.db`
+/// (on Windows `%LOCALAPPDATA%\ff\index.db`).
 pub fn default_db_path() -> Option<PathBuf> {
-    let var = |k| std::env::var_os(k).filter(|v| !v.is_empty());
-    if let Some(p) = var("FF_DB") {
+    if let Some(p) = std::env::var_os("FF_DB").filter(|v| !v.is_empty()) {
         return Some(p.into());
     }
     if std::fs::File::open(SYSTEM_DB).is_ok() {
         return Some(SYSTEM_DB.into());
     }
-    let cache = match var("XDG_CACHE_HOME") {
-        Some(c) => PathBuf::from(c),
-        None => PathBuf::from(var("HOME")?).join(".cache"),
-    };
-    Some(cache.join("ff/index.db"))
+    Some(os::cache_dir()?.join("ff").join("index.db"))
 }
 
 /// 1234567 -> "1,234,567".

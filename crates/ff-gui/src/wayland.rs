@@ -12,7 +12,7 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use crate::backend::{Backend, Cursor, Event, Key, Mods, Win, WindowSpec};
+use crate::backend::{Backend, Cursor, Event, FIRST, Key, Mods, Win, WindowSpec};
 use crate::canvas::Canvas;
 use crate::debug;
 use crate::xkb::{self, Keymap};
@@ -382,10 +382,21 @@ pub struct Wayland {
     /// user fixed for the layout, if any.
     wanted: (i32, i32),
     fixed_scale: Option<f32>,
+    /// The first search window.
     main: Window,
+    /// The other search windows by number (slot 0 unused; None: closed).
+    others: Vec<Option<Window>>,
+    /// The search window `select` chose.
+    selected: u8,
+    /// The main window's title, and whether we draw its title bar: to
+    /// make it again after it was hidden.
+    title: String,
+    own_title: bool,
+    /// The main window is taken down (closed but still running).
+    hidden: bool,
     dialog: Option<Window>,
-    /// The pixel size last announced to the application.
-    announced: (usize, usize),
+    /// The pixel size last announced to the application, by window.
+    announced: Vec<(usize, usize)>,
 
     pointer: u32,
     cursor_device: u32,
@@ -459,8 +470,13 @@ impl Wayland {
             wanted: (spec.width, spec.height),
             fixed_scale: spec.scale,
             main: Window::default(),
+            others: vec![None],
+            selected: 0,
+            title: spec.title.to_string(),
+            own_title: false,
+            hidden: false,
             dialog: None,
-            announced: (0, 0),
+            announced: vec![(0, 0)],
             pointer: 0,
             cursor_device: 0,
             cursor: Cursor::Arrow,
@@ -481,7 +497,7 @@ impl Wayland {
             repeating: None,
             serial: 0,
             press_serial: 0,
-            press_win: Win::Main,
+            press_win: FIRST,
             data_device: 0,
             clip_source: 0,
             copied: String::new(),
@@ -509,7 +525,7 @@ impl Wayland {
         // output scale is the best guess.
         wl.scale = wl.outputs.values().copied().max().unwrap_or(1).max(1) as f32;
 
-        wl.main = wl.create_window(Win::Main, spec.title);
+        wl.main = wl.create_window(FIRST, spec.title);
         wl.w.send(wl.main.toplevel, 8, &[I(360), I(200)]); // set_min_size
         wl.w.send(wl.main.surface, 6, &[]); // commit: ask for the first configure
         while !wl.main.configured {
@@ -605,7 +621,7 @@ impl Wayland {
                 self.w.send(window.decoration, 1, &[U(2)]); // set_mode: server side
             }
         }
-        if self.fractional != 0 && win == Win::Main {
+        if self.fractional != 0 && win != Win::Dialog {
             window.fractional = self.w.new_id();
             self.w.send(self.fractional, 1, &[U(window.fractional), U(window.surface)]);
             self.objs.insert(window.fractional, Obj::Fractional);
@@ -633,19 +649,33 @@ impl Wayland {
         if surface == 0 {
             None
         } else if surface == self.main.surface {
-            Some(Win::Main)
+            Some(FIRST)
         } else if self.dialog.as_ref().is_some_and(|d| d.surface == surface) {
             Some(Win::Dialog)
         } else {
-            None
+            self.others.iter().position(|w| w.as_ref().is_some_and(|w| w.surface == surface)).map(|n| Win::Main(n as u8))
         }
     }
 
     fn window(&self, win: Win) -> Option<&Window> {
         match win {
-            Win::Main => Some(&self.main),
+            Win::Main(0) => Some(&self.main),
+            Win::Main(n) => self.others.get(n as usize).and_then(Option::as_ref),
             Win::Dialog => self.dialog.as_ref(),
         }
+    }
+
+    fn window_mut(&mut self, win: Win) -> Option<&mut Window> {
+        match win {
+            Win::Main(0) => Some(&mut self.main),
+            Win::Main(n) => self.others.get_mut(n as usize).and_then(Option::as_mut),
+            Win::Dialog => self.dialog.as_mut(),
+        }
+    }
+
+    /// The search windows open, by number.
+    fn mains(&self) -> Vec<Win> {
+        std::iter::once(FIRST).chain((1..self.others.len()).filter(|&n| self.others[n].is_some()).map(|n| Win::Main(n as u8))).collect()
     }
 
     /// The scale as a whole number, for compositors that take no other.
@@ -653,16 +683,22 @@ impl Wayland {
         (self.scale.ceil() as usize).max(1)
     }
 
-    /// Tells the application the main window's size in pixels if it changed.
-    fn announce_size(&mut self) {
-        if self.main.lw <= 0 || self.main.lh <= 0 {
+    /// Tells the application a search window's size in pixels if it
+    /// changed.
+    fn announce_size(&mut self, win: Win) {
+        let Win::Main(n) = win else { return };
+        let Some((lw, lh)) = self.window(win).map(|w| (w.lw, w.lh)) else { return };
+        if lw <= 0 || lh <= 0 {
             return;
         }
         let px = |v: i32| ((v as f32 * self.scale).round() as usize).max(1);
-        let size = (px(self.main.lw), px(self.main.lh));
-        if size != self.announced {
-            self.announced = size;
-            self.pending.push_back(Event::Resize(size.0, size.1));
+        let size = (px(lw), px(lh));
+        if self.announced.len() <= n as usize {
+            self.announced.resize(n as usize + 1, (0, 0));
+        }
+        if size != self.announced[n as usize] {
+            self.announced[n as usize] = size;
+            self.pending.push_back(Event::Resize(win, size.0, size.1));
         }
     }
 
@@ -797,35 +833,39 @@ impl Wayland {
                 if scale > 0.0 && (scale - self.scale).abs() > 0.001 {
                     self.scale = scale;
                     self.pending.push_back(Event::Scale(scale));
-                    self.announce_size();
-                    self.pending.push_back(Event::Redraw(Win::Main));
+                    for win in self.mains() {
+                        self.announce_size(win);
+                        self.pending.push_back(Event::Redraw(win));
+                    }
                 }
             }
             (Obj::Toplevel(win), 0) => {
                 let (w, h) = (a.i(), a.i());
                 let maximized = a.bytes().chunks_exact(4).any(|s| s == [1, 0, 0, 0]);
-                if win == Win::Main {
-                    self.main.asked = (w, h);
-                    self.main.maximized = maximized;
+                if let Some(window) = self.window_mut(win).filter(|_| win != Win::Dialog) {
+                    window.asked = (w, h);
+                    window.maximized = maximized;
                 }
             }
             (Obj::Toplevel(win), 1) => self.pending.push_back(Event::Close(win)),
             (Obj::XdgSurface(win), 0) => {
                 self.w.send(object, 4, &[U(a.u())]); // ack_configure
                 match win {
-                    Win::Main => {
-                        let (w, h) = self.main.asked;
-                        if w > 0 && h > 0 {
-                            (self.main.lw, self.main.lh) = (w, h);
-                        } else if self.main.lw == 0 {
-                            // Our choice: the wanted size, in the compositor's units.
-                            // A layout zoomed by the user needs that much more room.
-                            let zoom = self.fixed_scale.map_or(1.0, |fixed| fixed / self.scale);
-                            self.main.lw = (self.wanted.0 as f32 * zoom).round().max(1.0) as i32;
-                            self.main.lh = (self.wanted.1 as f32 * zoom).round().max(1.0) as i32;
+                    Win::Main(_) => {
+                        // Our choice: the wanted size, in the compositor's units.
+                        // A layout zoomed by the user needs that much more room.
+                        let zoom = self.fixed_scale.map_or(1.0, |fixed| fixed / self.scale);
+                        let wanted = ((self.wanted.0 as f32 * zoom).round().max(1.0) as i32, (self.wanted.1 as f32 * zoom).round().max(1.0) as i32);
+                        if let Some(window) = self.window_mut(win) {
+                            let (w, h) = window.asked;
+                            if w > 0 && h > 0 {
+                                (window.lw, window.lh) = (w, h);
+                            } else if window.lw == 0 {
+                                (window.lw, window.lh) = wanted;
+                            }
+                            window.configured = true;
                         }
-                        self.main.configured = true;
-                        self.announce_size();
+                        self.announce_size(win);
                     }
                     Win::Dialog => {
                         if let Some(dialog) = self.dialog.as_mut() {
@@ -836,7 +876,7 @@ impl Wayland {
                 self.pending.push_back(Event::Redraw(win));
             }
             (Obj::Buffer, 0) => {
-                let windows = std::iter::once(&mut self.main).chain(self.dialog.as_mut());
+                let windows = std::iter::once(&mut self.main).chain(self.others.iter_mut().flatten()).chain(self.dialog.as_mut());
                 if let Some(buffer) = windows.flat_map(|w| w.buffers.iter_mut()).find(|b| b.id == object) {
                     buffer.busy = false;
                 }
@@ -1072,7 +1112,7 @@ impl Wayland {
         if self.cursor_device != 0 {
             // wp_cursor_shape_device_v1 shapes, named as in CSS.
             let shape = match self.cursor {
-                _ if self.pointer_focus != Some(Win::Main) => 1, // default
+                _ if !matches!(self.pointer_focus, Some(Win::Main(_))) => 1, // default
                 Cursor::Arrow => 1,
                 Cursor::Text => 9,
                 // nw, n, ne, e, se, s, sw, w
@@ -1203,17 +1243,16 @@ impl Backend for Wayland {
     }
 
     fn present(&mut self, win: Win, cv: &Canvas) -> io::Result<()> {
-        let mut window = match win {
-            Win::Main => std::mem::take(&mut self.main),
-            Win::Dialog => match self.dialog.take() {
-                Some(window) => window,
-                None => return Ok(()),
-            },
-        };
+        if win == FIRST && self.hidden {
+            return Ok(()); // taken down: nothing to draw on
+        }
+        let Some(mut window) = self.window_mut(win).map(std::mem::take) else { return Ok(()) };
+        if window.surface == 0 {
+            return Ok(());
+        }
         let result = self.present_window(&mut window, cv);
-        match win {
-            Win::Main => self.main = window,
-            Win::Dialog => self.dialog = Some(window),
+        if let Some(slot) = self.window_mut(win) {
+            *slot = window;
         }
         result?;
         self.w.flush()
@@ -1223,8 +1262,60 @@ impl Backend for Wayland {
         if self.main.decoration == 0 {
             return true; // this compositor draws no title bars: it is ours to draw
         }
-        self.w.send(self.main.decoration, 1, &[U(if own { 1 } else { 2 })]); // set_mode
+        self.own_title = own;
+        for win in self.mains() {
+            if let Some(decoration) = self.window(win).map(|w| w.decoration).filter(|&d| d != 0) {
+                self.w.send(decoration, 1, &[U(if own { 1 } else { 2 })]); // set_mode
+            }
+        }
         own
+    }
+
+    fn open_window(&mut self) -> io::Result<u8> {
+        let n = (1..self.others.len()).find(|&n| self.others[n].is_none()).unwrap_or(self.others.len());
+        if n > u8::MAX as usize {
+            return Err(err("too many windows"));
+        }
+        let win = Win::Main(n as u8);
+        let title = self.title.clone();
+        let mut window = self.create_window(win, &title);
+        if window.decoration != 0 {
+            self.w.send(window.decoration, 1, &[U(if self.own_title { 1 } else { 2 })]); // set_mode
+        }
+        self.w.send(window.toplevel, 8, &[I(360), I(200)]); // set_min_size
+        // As big as the first window.
+        (window.lw, window.lh) = (self.main.lw, self.main.lh);
+        self.w.send(window.surface, 6, &[]); // commit: ask for the first configure
+        if self.others.len() <= n {
+            self.others.resize_with(n + 1, || None);
+        }
+        self.others[n] = Some(window);
+        while self.window(win).is_some_and(|w| !w.configured) {
+            self.step(None)?;
+        }
+        Ok(n as u8)
+    }
+
+    fn close_window(&mut self, n: u8) {
+        let Some(window) = self.others.get_mut(n as usize).and_then(Option::take) else { return };
+        self.destroy_window(window);
+        for focus in [&mut self.pointer_focus, &mut self.keyboard_focus] {
+            if *focus == Some(Win::Main(n)) {
+                *focus = None;
+            }
+        }
+        if self.press_win == Win::Main(n) {
+            self.press_win = FIRST;
+        }
+        if let Some(size) = self.announced.get_mut(n as usize) {
+            *size = (0, 0);
+        }
+        self.repeating = None;
+        let _ = self.w.flush();
+    }
+
+    fn select(&mut self, n: u8) {
+        self.selected = n;
     }
 
     fn dialog_needs_title_bar(&self) -> bool {
@@ -1238,7 +1329,7 @@ impl Backend for Wayland {
     }
 
     fn set_cursor(&mut self, cursor: Cursor) {
-        if std::mem::replace(&mut self.cursor, cursor) != cursor && self.pointer_focus == Some(Win::Main) {
+        if std::mem::replace(&mut self.cursor, cursor) != cursor && matches!(self.pointer_focus, Some(Win::Main(_))) {
             self.set_cursor(self.enter_serial);
         }
     }
@@ -1246,15 +1337,58 @@ impl Backend for Wayland {
     fn start_resize(&mut self, edge: u32) {
         // From "0 top-left, then clockwise" to xdg_toplevel's edge bits.
         let edges = [5, 1, 9, 8, 10, 2, 6, 4][edge as usize % 8];
-        self.w.send(self.main.toplevel, 6, &[U(self.seat), U(self.press_serial), U(edges)]);
+        if let Some(toplevel) = self.window(self.press_win).map(|w| w.toplevel) {
+            self.w.send(toplevel, 6, &[U(self.seat), U(self.press_serial), U(edges)]);
+        }
+    }
+
+    fn hide_to_tray(&mut self) -> bool {
+        // Wayland has no hidden windows: take it down, keeping its size,
+        // and make it again when asked.
+        self.close_dialog();
+        let main = std::mem::take(&mut self.main);
+        (self.main.lw, self.main.lh) = (main.lw, main.lh);
+        self.destroy_window(main);
+        for focus in [&mut self.pointer_focus, &mut self.keyboard_focus] {
+            *focus = None;
+        }
+        self.repeating = None;
+        self.hidden = true;
+        let _ = self.w.flush();
+        true
+    }
+
+    fn show(&mut self) {
+        if !std::mem::replace(&mut self.hidden, false) {
+            return;
+        }
+        let (lw, lh) = (self.main.lw, self.main.lh);
+        let title = self.title.clone();
+        self.main = self.create_window(FIRST, &title);
+        if self.main.decoration != 0 {
+            self.w.send(self.main.decoration, 1, &[U(if self.own_title { 1 } else { 2 })]); // set_mode
+        }
+        self.w.send(self.main.toplevel, 8, &[I(360), I(200)]); // set_min_size
+        (self.main.lw, self.main.lh) = (lw, lh);
+        self.w.send(self.main.surface, 6, &[]); // commit: ask for the first configure
+        while !self.main.configured {
+            if self.step(None).is_err() {
+                return;
+            }
+        }
+        self.pending.push_back(Event::Redraw(FIRST));
     }
 
     fn minimize(&mut self) {
-        self.w.send(self.main.toplevel, 13, &[]);
+        if let Some(toplevel) = self.window(Win::Main(self.selected)).map(|w| w.toplevel) {
+            self.w.send(toplevel, 13, &[]);
+        }
     }
 
     fn toggle_maximize(&mut self) {
-        self.w.send(self.main.toplevel, if self.main.maximized { 10 } else { 9 }, &[]);
+        if let Some((toplevel, maximized)) = self.window(Win::Main(self.selected)).map(|w| (w.toplevel, w.maximized)) {
+            self.w.send(toplevel, if maximized { 10 } else { 9 }, &[]);
+        }
     }
 
     fn copy(&mut self, text: &str, file: bool) -> bool {
@@ -1315,6 +1449,11 @@ impl Backend for Wayland {
         self.close_dialog();
         let main = std::mem::take(&mut self.main);
         self.destroy_window(main);
+        for n in 1..self.others.len() {
+            if let Some(window) = self.others[n].take() {
+                self.destroy_window(window);
+            }
+        }
         if self.w.flush().is_err() {
             return;
         }
@@ -1341,7 +1480,8 @@ impl Backend for Wayland {
         let mut dialog = self.create_window(Win::Dialog, title);
         dialog.lw = (w as f32 / self.scale).ceil().max(1.0) as i32;
         dialog.lh = (h as f32 / self.scale).ceil().max(1.0) as i32;
-        self.w.send(dialog.toplevel, 1, &[U(self.main.toplevel)]); // set_parent
+        let parent = self.window(Win::Main(self.selected)).map_or(self.main.toplevel, |w| w.toplevel);
+        self.w.send(dialog.toplevel, 1, &[U(parent)]); // set_parent
         self.w.send(dialog.toplevel, 8, &[I(dialog.lw), I(dialog.lh)]); // set_min_size
         self.w.send(dialog.toplevel, 7, &[I(dialog.lw), I(dialog.lh)]); // set_max_size: fixed
         self.w.send(dialog.surface, 6, &[]); // commit

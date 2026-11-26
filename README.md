@@ -4,7 +4,7 @@
 [![CI](https://github.com/khunder/fast-search/actions/workflows/ci.yml/badge.svg)](https://github.com/khunder/fast-search/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Instant file search for Linux.** Type part of a name and get every
+**Instant file search for Linux and Windows.** Type part of a name and get every
 matching file on the disk in milliseconds.
 
 ![Fast search window](docs/screenshot.png)
@@ -49,6 +49,8 @@ Packages for 64-bit Intel/AMD Linux are attached to every
 | Arch Linux | [`packaging/arch/PKGBUILD`](packaging/arch/PKGBUILD) | `cd packaging/arch && makepkg -si` |
 | Any distribution | [`fast-search-x86_64.AppImage`](https://github.com/khunder/fast-search/releases/latest/download/fast-search-x86_64.AppImage) | `chmod +x` it and run it |
 | Plain binaries | [`fast-search-x86_64.tar.gz`](https://github.com/khunder/fast-search/releases/latest/download/fast-search-x86_64.tar.gz) | unpack anywhere |
+| Windows 10/11 | [`fast-search-windows-x86_64-setup.exe`](https://github.com/khunder/fast-search/releases/latest/download/fast-search-windows-x86_64-setup.exe) | run it; see [Windows](#windows) |
+| Windows, no installer | [`fast-search-windows-x86_64.zip`](https://github.com/khunder/fast-search/releases/latest/download/fast-search-windows-x86_64.zip) | unzip anywhere |
 
 Each contains `ff`, `ff-gui` and `ffd`. The AppImage starts the window;
 `./fast-search-x86_64.AppImage ff ...` runs the command. The packages are
@@ -358,16 +360,57 @@ disk, and a file with several hard links is counted once per link.
 The window reloads the index by itself whenever the index file changes,
 so results follow `ff index` runs and the daemon.
 
-It has a light and a dark theme and follows the desktop's preference
-unless you choose one under **Options → Interface**. The window is
+It has six themes: Light, Dark, Graphite (dark grey), Mist (light grey),
+Dusk (blue-grey dark) and Sand (warm light). By default it follows the
+desktop's light or dark preference; choose another in the **Theme** menu
+or under **Options → Interface**. The accent colour (selection, focus)
+is the desktop's (on Windows, its accent colour) unless you pick one of
+seven at the bottom of the **Theme** menu.
+
+File icons are the ones the system's file manager shows: on Windows
+Explorer's (a program's or shortcut's own, read in the background), on
+Linux the desktop's icon theme (GNOME's or KDE's setting, or
+`FF_ICON_THEME`), found by type from the MIME database. A dark window
+takes the theme's dark variant (`breeze-dark`, `Papirus-Dark`), and KDE's
+monochrome icons take the window's text and accent colours, as in KDE.
+PNG icons are decoded directly; SVG ones are converted once with
+`rsvg-convert` when it is installed (kept in `~/.cache/ff/icons`), and
+otherwise drawn by a small built-in SVG renderer. Without an icon theme
+the built-in icons are used; *Options → View → File icons from the
+system* turns this off.
+
+One copy runs per user. Closing the window (or Esc on an empty search)
+ends its search and keeps the program running with the index loaded,
+hidden (on Windows, in the notification area; Linux desktops have no
+common tray). The global shortcut, or starting `ff-gui` again, then
+shows it at once with an empty search; pressed while a window is open,
+it opens another search window, as Everything does. Each window has a
+search, results and view of its own; all share one index, kept current
+once for all, and the settings. Closing one of these other windows
+closes it for good. *File → Quit* (Ctrl+Q) exits. *Options → Desktop* turns the hiding off, and *Start at
+sign-in, hidden* adds the program to the session's start (on Linux an
+XDG autostart entry, `~/.config/autostart/ff-gui.desktop`).
+
+The window is
 available in English, French, Spanish and Italian (same page; it follows
 the system language by default). It follows the desktop scale (fractional scaling on Wayland, `Xft.dpi` on X11). Override with `FF_GUI_SCALE=1.5`
 and choose a font file with `FF_GUI_FONT=/path/to/font.ttf`.
 
 ## Live updates: the `ffd` daemon
 
-Without the daemon, the index is a snapshot: it is as fresh as your last
-`ff index`. With it, the index follows the disk.
+Without the daemon, the window follows the disk by itself while it runs
+(which, kept in the notification area, is from sign-in): it watches the
+indexed drives (`ReadDirectoryChangesW` on Windows, inotify on Linux)
+and patches its index in place, so new, renamed and deleted files show
+within a moment. At start it catches up with what changed while it was
+not running: every folder whose modification time differs from the
+index's is read again, checked in the background, one thread per drive
+(about three minutes for 1.7 million folders on an SSD and three hard
+disks). It writes the index file back once changes stop for
+30 seconds while it is hidden (at most hourly while files keep changing,
+since the file is large) and when it quits; `ff` on the command line
+reads that file. With the daemon, the index file itself follows the
+disk, for every user and with no window running.
 
 ```
             root                              your user
@@ -431,6 +474,114 @@ they cannot open.** Only names, sizes and dates are exposed, never
 contents. Use a group that contains only the people who should have that
 view; without `--group`, only root can read the index.
 
+## Windows
+
+All three programs and the library run natively on 64-bit Windows 10 and
+later, with the same features and options as on Linux. A release attaches
+two downloads:
+
+- **`fast-search-windows-x86_64-setup.exe`**, the installer. It installs
+  for the current user (no administrator rights; the default folder is
+  `%LOCALAPPDATA%\Programs\Fast search`) or, if you choose, for all users
+  in `Program Files`. It adds the folder to `PATH`, puts "Fast search" in
+  the Start menu with the Ctrl+Alt+F hot key, can add a desktop shortcut,
+  and, when installed for all users, can install the `ffd` service.
+  Uninstall it from *Settings > Apps*. Silent install:
+  `fast-search-windows-x86_64-setup.exe /VERYSILENT /CURRENTUSER /DIR=C:\tools\fast-search`.
+- **`fast-search-windows-x86_64.zip`**, the bare `ff.exe`, `ff-gui.exe` and
+  `ffd.exe`, to unpack anywhere.
+
+**Updating:** `ff update`, or *Help > Check for updates* in the window,
+asks GitHub for the latest release and, if it is newer, downloads its
+installer and runs it silently. The installer keeps the folder, the
+choices made and the install mode, and the window opens again when it is
+done. Copies unpacked from the zip are told where to download instead.
+
+Build them with Rust installed through rustup (the pinned nightly is
+fetched on the first build). Cargo's default target is Linux musl, so name
+the Windows one:
+
+```sh
+cargo win                      # x86_64-pc-windows-msvc (Visual Studio Build Tools)
+cargo win-gnu                  # x86_64-pc-windows-gnu (no Visual Studio needed)
+cargo test --target x86_64-pc-windows-msvc
+```
+
+The `.exe` files land in `target/<target>/release/` and need nothing
+installed (the C runtime is linked in). `ff-gui.exe` carries the
+application icon, drawn by the same code as the window's (MSVC builds).
+The installer is built with [Inno Setup 6](https://jrsoftware.org/isinfo.php):
+
+```sh
+cargo win
+pwsh packaging/windows/build-installer.ps1   # writes dist/fast-search-windows-x86_64-setup.exe
+```
+
+What differs from Linux:
+
+- **Paths** are written the Windows way, `C:\Users\me\notes.txt`. In a
+  search term, `/` and `\` both separate folders: `src/main` and
+  `src\main` find the same files.
+- **What is indexed by default** is every fixed drive (`C:\`, `D:\`, ...),
+  skipping `System Volume Information`, `$Recycle.Bin`, `$WinREAgent` and
+  `Config.Msi`. `--no-hidden` also leaves out files with the hidden
+  attribute.
+- **NTFS drives are read from their master file table** when the program
+  may open the whole volume: as administrator, and so always for the
+  `ffd` service. The table is read front to back, with no seek per
+  folder, so even hard disks are indexed in seconds (9.4 million files on
+  an SSD and three hard disks: about 23 s, against hours for the folder
+  walk). One reader runs per physical disk. Without administrator rights,
+  and for other filesystems, the folders are walked as on Linux;
+  `FF_NO_MFT=1` forces the walk.
+- **Files are kept** in `%LOCALAPPDATA%\ff\index.db` (the index) and
+  `%APPDATA%\ff` (settings, bookmarks).
+- **Desktop actions** use the shell: open with the default application,
+  show in Explorer, the file type's *Edit* action (else Notepad), and
+  deleting: Del (to the Recycle Bin) and Shift+Del (for good) are handed
+  to Windows, which asks and shows its progress as Explorer does. Deletes
+  run in the background on every system, and the results drop what went
+  at once, without rebuilding the index.
+- **`ff -i`** runs in Windows Terminal or the classic console. Enter and
+  F4 open `%VISUAL%` or `%EDITOR%`, else Notepad. There is no `sudoedit`
+  and no Ctrl+Z suspend.
+- **The window** looks like a Windows 11 program: its menus sit in the
+  title bar (Windows keeps the rounded corners, shadow and resize
+  borders; *Options → Menus in the title bar* turns it off), text is
+  drawn with ClearType in Segoe UI, the accent colour is the desktop's,
+  it follows the Windows dark mode setting, and file icons are the ones
+  Explorer shows (*Options → View* switches to the built-in ones). Results can be dragged
+  to Explorer and copied as files. The global shortcut (default
+  Ctrl+Alt+F; set it in *Options → Desktop* by pressing the keys, such as
+  Alt+Q) is registered by the running window, so it works while Fast
+  search runs, which it does from sign-in; if another program holds the
+  keys, Options says so. Dragging a column header's right edge sizes that
+  column; those after it move along.
+  Closing the window (its X, Alt+F4, or Esc on an empty search) hides it
+  to the notification area, index loaded: the shortcut, or starting
+  `ff-gui` again, shows it at once, empty; pressed again while it is
+  open, the shortcut opens another search window. *File → Quit*, Ctrl+Q or the tray
+  icon's *Exit* quit for real; *Options → Desktop* turns the hiding off.
+  There too, *Start at sign-in* starts it hidden when you sign in (also
+  a choice in the installer), so the shortcut is instant from the start.
+- **Live updates:** `ffd` watches each drive with `ReadDirectoryChangesW`
+  and publishes `C:\ProgramData\ff\index.db`, which `ff` and `ff-gui` then
+  use. Install it as a service from an administrator prompt (or from the
+  window's Options):
+
+  ```sh
+  ffd --install-service       # auto-starting service, runs as LocalSystem
+  ffd --configure --skip D:   # per-drive choices, in C:\ProgramData\ff\ffd.conf
+  ffd --uninstall-service
+  ```
+
+  `ffd C:\Users` runs it in the console instead. Changes made while it
+  is stopped are picked up by the full scan when it starts. Every user of
+  the machine can read the published index, so it shows the names of all
+  files, as the reader group does on Linux.
+- Reading unmounted ext4 or NTFS partitions by device (`--device`) is
+  Linux only.
+
 ## Packaging and releases
 
 ```sh
@@ -443,10 +594,12 @@ AppImage needs `mksquashfs` and `curl`; a package whose tool is missing is
 skipped.
 
 Releases are made by GitHub Actions (`.github/workflows/release.yml`):
-pushing a tag such as `v0.2.0` runs the tests, builds all four packages,
-checks them (the `.deb` is installed and run) and publishes them as a
-release. Set the same version in `Cargo.toml` first. The website's
-download buttons point at the latest release, so they need no update.
+pushing a tag such as `v0.2.0` (or `0.2.0`) runs the tests, builds all
+four packages and the Windows installer and zip, checks them (the `.deb`
+is installed and run) and publishes them as a release. The programs,
+packages and installer all take their version from the tag
+(`packaging/version.sh`). The website's download buttons point at the
+latest release, so they need no update.
 
 ## Tests
 
@@ -488,11 +641,15 @@ and the checklist before a release are in
 
 ## Limitations
 
-- Linux only. The window runs natively on Wayland and on X11.
+- Linux and Windows (see [Windows](#windows)). On Linux the window runs
+  natively on Wayland and on X11.
 - On Wayland, typing accents with dead keys or Compose is not supported
   yet, and a compositor without title bars of its own (GNOME) always gets
   the built-in title bar.
-- Without the daemon, changes are only picked up by `ff index` or F5.
+- Without the daemon and with no window running, changes are only picked
+  up by `ff index` or F5. On Linux the window needs one inotify watch per
+  folder; past the system's limit (`fs.inotify.max_user_watches`) some
+  folders are not followed, and the window says so.
 - Files on a drive read directly (not mounted) can be found, not opened.
 - Regular expressions use a compact engine: `\d`, `\w` and `\s` are
   ASCII-only.

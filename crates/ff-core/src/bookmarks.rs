@@ -14,13 +14,11 @@ pub struct Bookmark {
     pub flags: String,
 }
 
-/// `~/.config/ff/bookmarks.tsv` (or under `$XDG_CONFIG_HOME`).
+/// `~/.config/ff/bookmarks.tsv` (or under `$XDG_CONFIG_HOME`; on
+/// Windows `%APPDATA%\ff\bookmarks.tsv`).
 pub fn file() -> io::Result<PathBuf> {
-    let config = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(std::env::var_os("HOME").ok_or_else(|| io::Error::other("HOME is not set"))?).join(".config"),
-    };
-    Ok(config.join("ff/bookmarks.tsv"))
+    let config = crate::os::config_dir().ok_or_else(|| io::Error::other("HOME is not set"))?;
+    Ok(config.join("ff").join("bookmarks.tsv"))
 }
 
 /// One bookmark per line: name, search and flags, separated by tabs.
